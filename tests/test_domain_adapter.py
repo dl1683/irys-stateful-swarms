@@ -252,6 +252,6 @@ class TestCustomAdapter:
             structural_profile_hint="Count subsystems and specifications.",
         )
         assert adapter.name == "aerospace"
-        assert "thrust" in adapter.extraction_prompt_suffix()
+        assert "thrust" in adapter.get_extraction_prompt_suffix()
         assert "subsystem" in adapter.get_synthesis_prompt_suffix()
         assert "TRL" in adapter.entity_patterns[0]

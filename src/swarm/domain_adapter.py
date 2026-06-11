@@ -280,7 +280,8 @@ FINANCE_ADAPTER = DomainAdapter(
     synthesis_guidance=(
         "Structure by analytical dimension (revenue, profitability, "
         "cash flow, balance sheet, valuation, risk). Include exact "
-        "financial figures with periods. Show year-over-year comparisons. "
+        "financial figures with periods, including revenue, EBITDA, "
+        "margins, and EPS. Show year-over-year comparisons. "
         "Flag material changes and their drivers. Include management "
         "guidance and forward-looking metrics."
     ),
