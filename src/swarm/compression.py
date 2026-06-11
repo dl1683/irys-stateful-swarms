@@ -91,14 +91,13 @@ def score_entry(
     ref_count = len(entry.supports_entries or []) + len(entry.contradicts_entries or [])
     cross_ref = min(0.3, ref_count * 0.05)
 
-    # Source diversity bonus: entries from underrepresented documents get a
-    # small boost to ensure we don't overweight any single source
+    # Source-diversity is assigned in batch scoring (score_all_entries), which
+    # has the per-document counts needed to reward under-represented sources
+    # and penalise over-represented ones. In isolation a single entry carries a
+    # neutral 0.0 — the previous `doc in source_doc_set` check was always true
+    # (source_doc_set is the set of all docs) and so added a constant to every
+    # entry, contributing nothing to ranking.
     source_diversity = 0.0
-    if entry.source and entry.source.document:
-        # If this is the only entry from its doc, it's more valuable
-        doc = entry.source.document
-        if doc in source_doc_set:
-            source_diversity = 0.05  # will be adjusted in batch scoring
 
     # Confidence factor
     conf_factor = min(1.0, entry.confidence) if entry.confidence > 0 else 0.5
@@ -226,43 +225,53 @@ def compress_for_synthesis(
     # Sort by composite score descending
     scored.sort(key=lambda s: s.composite, reverse=True)
 
-    # Phase 1: Diversity floor — guarantee min_per_doc per document
+    # target_count is a HARD cap — the synthesis prompt has a finite context
+    # budget, so no phase may push the selection past it. cap == 0 selects
+    # nothing.
+    cap = max(0, target_count)
     selected_ids: set[str] = set()
     selected: list[ScoredEntry] = []
+
+    def _take(se: ScoredEntry) -> bool:
+        if len(selected) >= cap or se.entry.id in selected_ids:
+            return False
+        selected.append(se)
+        selected_ids.add(se.entry.id)
+        return True
+
+    # Phase 1: Diversity floor — up to min_per_doc per document, allocated
+    # round-robin by within-doc rank so one dominant document cannot consume
+    # the whole cap before minor documents get represented. (scored is already
+    # sorted, so doc_entries lists are best-first.)
     doc_entries: dict[str, list[ScoredEntry]] = {}
     for se in scored:
         doc = se.entry.source.document if se.entry.source else "cross_cutting"
         doc_entries.setdefault(doc or "cross_cutting", []).append(se)
 
-    for doc, entries in doc_entries.items():
-        for se in entries[:min_per_doc]:
-            if se.entry.id not in selected_ids:
-                selected.append(se)
-                selected_ids.add(se.entry.id)
+    for rank in range(min_per_doc):
+        if len(selected) >= cap:
+            break
+        for entries in doc_entries.values():
+            if rank < len(entries):
+                _take(entries[rank])
+                if len(selected) >= cap:
+                    break
 
-    # Phase 2: Type diversity — ensure at least one entry per type
+    # Phase 2: Type diversity — ensure at least one entry per type, within cap
     if ensure_types:
         type_present = {se.entry.type for se in selected}
-        all_types = {se.entry.type for se in scored}
-        missing_types = all_types - type_present
+        missing_types = {se.entry.type for se in scored} - type_present
         for se in scored:
-            if not missing_types:
+            if not missing_types or len(selected) >= cap:
                 break
-            if se.entry.type in missing_types and se.entry.id not in selected_ids:
-                selected.append(se)
-                selected_ids.add(se.entry.id)
+            if se.entry.type in missing_types and _take(se):
                 missing_types.discard(se.entry.type)
 
     # Phase 3: Fill remaining slots by score
-    remaining_budget = target_count - len(selected)
-    if remaining_budget > 0:
-        for se in scored:
-            if remaining_budget <= 0:
-                break
-            if se.entry.id not in selected_ids:
-                selected.append(se)
-                selected_ids.add(se.entry.id)
-                remaining_budget -= 1
+    for se in scored:
+        if len(selected) >= cap:
+            break
+        _take(se)
 
     deferred = [se for se in scored if se.entry.id not in selected_ids]
 
@@ -274,8 +283,10 @@ def compress_for_synthesis(
         coverage_doc[doc or "cross_cutting"] = coverage_doc.get(doc or "cross_cutting", 0) + 1
         coverage_type[se.entry.type] = coverage_type.get(se.entry.type, 0) + 1
 
-    # Rough token estimate: ~4 chars per token, each entry ~300 chars average
-    tokens_saved = len(deferred) * 75  # ~75 tokens per deferred entry
+    # Token estimate from the ACTUAL deferred content (~4 chars per token),
+    # not a flat per-entry guess — entry sizes vary widely, so a constant
+    # would misreport savings on short- or long-entry blackboards.
+    tokens_saved = sum(len(se.entry.content or "") for se in deferred) // 4
 
     return CompressionResult(
         selected=selected,
@@ -297,10 +308,15 @@ def ranked_entries_for_curation(
     blackboard: Blackboard,
     max_entries: int = 500,
 ) -> list[Entry]:
-    """Return entries ranked by synthesis relevance, for use in curation.py.
+    """Return the top ``max_entries`` active entries ranked by synthesis
+    relevance.
 
-    Drop-in replacement for `active = [e for e in blackboard.entries if ...]`
-    that pre-filters by deterministic quality score.
+    This is a context-budget guard, NOT a replacement for curation.py's
+    exhaustive per-document enumeration. curation deliberately tries to surface
+    EVERY fact; pre-filtering defeats that. Use this only when the active set
+    is larger than a hard context budget can hold and some bounded loss is
+    unavoidable — feed the ranked subset to the LLM step instead of truncating
+    arbitrarily. When everything fits, pass the full active set to curation.
     """
     result = compress_for_synthesis(blackboard, target_count=max_entries)
     return [se.entry for se in result.selected]

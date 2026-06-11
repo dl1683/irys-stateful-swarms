@@ -133,6 +133,18 @@ class TestCompressForSynthesis:
         assert result.actual_count <= 50
         assert len(result.selected) <= 50
 
+    def test_many_docs_floor_respects_cap(self):
+        # min_per_doc * num_docs (5 * 10 = 50) would exceed target_count (20);
+        # the diversity floor must NOT blow the hard cap.
+        bb = Blackboard()
+        for d in range(10):
+            for i in range(10):
+                bb.add_entry(_mk(f"d{d}_e{i}", doc=f"doc{d}.pdf"))
+        result = compress_for_synthesis(bb, target_count=20, min_per_doc=5)
+        assert result.actual_count == 20
+        # round-robin floor should still spread across many docs, not one
+        assert len(result.coverage_by_doc) >= 4
+
     def test_diversity_floor(self):
         bb = Blackboard()
         # 100 entries from one doc, 3 from another
@@ -171,7 +183,8 @@ class TestCompressForSynthesis:
             bb.add_entry(_mk(f"entry {i}"))
         result = compress_for_synthesis(bb, target_count=100)
         assert result.tokens_saved_estimate > 0
-        assert result.tokens_saved_estimate == len(result.deferred) * 75
+        expected = sum(len(se.entry.content or "") for se in result.deferred) // 4
+        assert result.tokens_saved_estimate == expected
 
     def test_high_value_entries_selected(self):
         bb = Blackboard()
@@ -258,5 +271,6 @@ class TestEdgeCases:
         for i in range(10):
             bb.add_entry(_mk(f"entry {i}"))
         result = compress_for_synthesis(bb, target_count=0)
-        # min_per_doc ensures at least some entries are selected
-        assert result.actual_count >= 0
+        # target_count is a hard cap; zero means select nothing.
+        assert result.actual_count == 0
+        assert len(result.deferred) == 10
