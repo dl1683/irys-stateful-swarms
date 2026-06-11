@@ -6,9 +6,11 @@ import pytest
 from src.swarm.blackboard import Blackboard
 from src.swarm.entity_resolution import (
     MatchResult,
+    _clean_entity_name,
     _cluster_matches,
     _jaro_winkler,
     _levenshtein_ratio,
+    _looks_like_entity,
     _normalize_entity,
     _is_prefix_variant,
     _token_overlap,
@@ -287,3 +289,99 @@ class TestEdgeCases:
         # High threshold — might not match
         result_high = resolve_entities(bb, threshold=0.95)
         assert len(result_low.match_pairs) >= len(result_high.match_pairs)
+
+
+# -----------------------------------------------------------------------
+# Precision regressions — the false positives observed on real blackboards
+# -----------------------------------------------------------------------
+
+class TestPrecisionRegressions:
+    """Guards against the noise the resolver produced on the repo's own
+    example blackboards: defined-term/concept names, leading-word pollution,
+    duplicate entries, and over-confident fuzzy assertions."""
+
+    def _entry(self, content: str, doc: str = "d.pdf") -> Entry:
+        return Entry(
+            id=gen_entry_id(), type="observation", content=content,
+            source=EntrySource(document=doc),
+            created_by=WorkerRecord("w", "d", 0), confidence=0.9,
+        )
+
+    def test_clean_entity_name_strips_leading_noise(self):
+        assert _clean_entity_name("For Zenith Petrochemical Industries LLC") == \
+            "Zenith Petrochemical Industries LLC"
+        assert _clean_entity_name("The Commitment Letter") == "Commitment Letter"
+        assert _clean_entity_name("Swiss Commercial Register No") == \
+            "Swiss Commercial Register"
+
+    def test_defined_terms_are_not_entities(self):
+        for term in ("term loan", "closing date", "administrative agent",
+                     "beneficial ownership", "exact match",
+                     "material adverse effect", "restricted subsidiary"):
+            assert not _looks_like_entity(term), f"{term!r} should be filtered"
+        # A name with a distinctive token survives.
+        assert _looks_like_entity("zenith petrochem industries")
+
+    def test_defined_terms_produce_no_clusters(self):
+        bb = Blackboard()
+        bb.add_entry(self._entry("The Term Loan matures in 2029.", doc="a.pdf"))
+        bb.add_entry(self._entry("Each Term Loans bears interest.", doc="b.pdf"))
+        bb.add_entry(self._entry("The Credit Agreement governs.", doc="a.pdf"))
+        bb.add_entry(self._entry("This Credit Agreement is amended.", doc="b.pdf"))
+        result = resolve_entities(bb, threshold=0.65)
+        assert result.clusters == []
+        assert not any("entity_resolution" in (e.tags or []) for e in bb.entries)
+
+    def test_fuzzy_match_is_a_low_confidence_candidate(self):
+        bb = Blackboard()
+        bb.add_entry(self._entry(
+            "Exporter: Zenith Petrochem Industries LLC.", doc="a.pdf"))
+        bb.add_entry(self._entry(
+            "Party: Zenith Petrochemical Industries LLC.", doc="b.pdf"))
+        resolve_entities(bb, threshold=0.65)
+        candidates = [e for e in bb.entries if "candidate" in (e.tags or [])]
+        assert len(candidates) >= 1
+        assert all(e.confidence <= 0.7 for e in candidates)
+        assert all("CANDIDATE" in e.content for e in candidates)
+
+    def test_distinct_prefix_entities_not_asserted_confident(self):
+        # Petrochem vs Petroleum share a prefix but are distinct; if matched at
+        # all they must be a review candidate, never a confident assertion.
+        bb = Blackboard()
+        bb.add_entry(self._entry("Zenith Petrochem Industries LLC ships goods.", doc="a.pdf"))
+        bb.add_entry(self._entry("Zenith Petroleum Industries LLC is screened.", doc="b.pdf"))
+        resolve_entities(bb, threshold=0.65)
+        for e in bb.entries:
+            if "entity_resolution" in (e.tags or []):
+                assert "exact" not in (e.tags or [])
+                assert e.confidence <= 0.7
+
+    def test_exact_suffix_variant_is_confident(self):
+        bb = Blackboard()
+        bb.add_entry(self._entry("Northbrook Capital Markets, LLC commits.", doc="a.pdf"))
+        bb.add_entry(self._entry("Northbrook Capital Markets LLC provided it.", doc="b.pdf"))
+        resolve_entities(bb, threshold=0.65)
+        exact = [e for e in bb.entries if "exact" in (e.tags or [])]
+        assert len(exact) == 1
+        assert exact[0].confidence == 0.9
+
+    def test_no_duplicate_resolution_entries(self):
+        # An entity repeated AND fuzzy-matched must yield exactly one entry.
+        bb = Blackboard()
+        for _ in range(3):
+            bb.add_entry(self._entry("Zenith Petrochem Industries LLC.", doc="a.pdf"))
+        bb.add_entry(self._entry("Zenith Petrochemical Industries LLC.", doc="b.pdf"))
+        result = resolve_entities(bb, threshold=0.65)
+        res_entries = [e for e in bb.entries if "entity_resolution" in (e.tags or [])]
+        assert len(res_entries) == len(result.entries_created) == 1
+
+    def test_canonical_has_no_leading_noise(self):
+        bb = Blackboard()
+        bb.add_entry(self._entry(
+            "For Crestmoor Trading AG and its affiliates.", doc="a.pdf"))
+        bb.add_entry(self._entry(
+            "Notify Crestmoor Trading immediately.", doc="b.pdf"))
+        report = run_entity_resolution(bb, threshold=0.6)
+        for cluster in report["clusters"]:
+            first = cluster["canonical"].split()[0].lower()
+            assert first not in {"for", "the", "notify", "all", "and"}

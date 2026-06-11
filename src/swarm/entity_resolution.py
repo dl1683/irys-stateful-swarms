@@ -14,6 +14,7 @@ No LLM calls. Pure deterministic string processing.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -43,6 +44,14 @@ def _normalize_entity(text: str) -> str:
     # Drop legal-entity suffixes for matching
     words = [w for w in words if w not in _SUFFIXES]
     return " ".join(words)
+
+
+def _depluralize(norm: str) -> str:
+    """Collapse a trailing plural 's' on each token for plural-variant detection."""
+    return " ".join(
+        t[:-1] if t.endswith("s") and len(t) > 3 else t
+        for t in norm.split()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -201,51 +210,108 @@ def _composite_score(jw: float, lev: float, tri: float, tok: float,
     return round(base, 4)
 
 
-# Thresholds — tuned to minimize false positives on the repo's examples
-MATCH_THRESHOLD = 0.72        # composite >= this → likely same entity
-HIGH_CONFIDENCE = 0.85        # composite >= this → almost certain
+# Composite-score thresholds. Fuzzy (non-exact) matches above MATCH_THRESHOLD
+# are surfaced as *candidates* for review, not asserted as identical — pure
+# string similarity cannot separate a true variant (Petrochem/Petrochemical)
+# from distinct entities sharing a prefix (Petrochem/Petroleum).
+MATCH_THRESHOLD = 0.72        # composite >= this → candidate same-entity match
+HIGH_CONFIDENCE = 0.85        # composite >= this → strong candidate
 
 
 # ---------------------------------------------------------------------------
 # Entity extraction from blackboard entries
 # ---------------------------------------------------------------------------
 
-# Heuristic patterns for entity-like substrings in observation content
-_ENTITY_PATTERN = re.compile(
-    r"(?:"
-    r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+(?::\s|,|\s—|\s–|\s\()"  # capitalized multi-word before punctuation
-    r"|"
-    r"(?:^|\.\s+)([A-Z][\w\s,]{5,50}?)(?:\s+(?:is|has|holds|commits|provides|located|incorporated|organized))"
-    r")",
-    re.MULTILINE,
-)
-
-# Broader: any sequence of capitalized words that looks like an organization
+# Any sequence of capitalized words that looks like an organization name.
 _ORG_LIKE = re.compile(
     r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+"
     r"(?:[,\s]+(?:Inc|LLC|Ltd|Corp|Corporation|Company|Holdings|Group|Partners|Associates|Bank|Capital|Finance|Equipment|Industries|Petrochem(?:ical)?|Solutions))?)"
     r"(?:\.|,|;|\s|$)"
 )
 
+# Capitalized words that lead a sentence or label but are not part of the
+# entity name ("For Zenith ...", "The Commitment Letter", "Notify ..."). These
+# are stripped from the front (and a trailing bare "No"/"No.") of a captured
+# name so canonical forms are clean.
+_LEADING_NOISE = {
+    "the", "a", "an", "for", "and", "all", "any", "each", "such", "this",
+    "that", "these", "those", "to", "of", "in", "on", "by", "per", "as", "at",
+    "or", "but", "if", "no", "see", "notify", "its", "their", "our", "we",
+    "you", "it", "is", "are", "was", "were", "from", "with", "into", "between",
+}
+
+# Common legal/financial *defined terms* and generic concepts. A candidate
+# whose every token is one of these is NOT a cross-document entity — it is a
+# defined term or concept ("Term Loan", "Closing Date", "Administrative Agent",
+# "Beneficial Ownership", "Exact Match"). This is the main precision guard: on
+# real blackboards the org-like regex otherwise treats every Title-Cased
+# defined term as an entity, flooding synthesis with false resolutions.
+# Note: words that genuinely indicate organizations (bank, capital, group,
+# holdings, trust, partners) are deliberately EXCLUDED so real names survive.
+_DEFINED_TERMS = {
+    "term", "loan", "loans", "closing", "date", "dates", "credit", "agreement",
+    "agreements", "administrative", "agent", "agents", "business", "day", "days",
+    "base", "rate", "rates", "eurocurrency", "revolving", "facility",
+    "facilities", "asset", "sale", "prepayment", "commitment", "commitments",
+    "letter", "letters", "beneficial", "beneficiary", "ownership", "exact",
+    "match", "matches", "trade", "finance", "operations", "operation",
+    "sanctions", "compliance", "officer", "collateral", "obligation",
+    "obligations", "interest", "principal", "maturity", "default", "event",
+    "events", "lender", "lenders", "borrower", "borrowers", "guarantor",
+    "guarantors", "security", "payment", "payments", "fee", "fees", "notice",
+    "notices", "party", "parties", "section", "sections", "article", "articles",
+    "schedule", "schedules", "exhibit", "exhibits", "annex", "appendix",
+    "definition", "definitions", "representation", "representations", "warranty",
+    "warranties", "covenant", "covenants", "condition", "conditions",
+    "exclusion", "exclusions", "endorsement", "amendment", "amendments",
+    "effective", "applicable", "issuer", "firm", "trustee", "obligor", "seller",
+    "buyer", "purchaser", "supplier", "vendor", "counterparty",
+    # Common defined-term / concept words seen flooding real blackboards.
+    "material", "adverse", "effect", "governmental", "authority",
+    "authorization", "authorizations", "subsidiary", "subsidiaries",
+    "restricted", "unrestricted", "possible", "potential", "permitted",
+    "specified", "designated", "relevant",
+}
+
+
+def _clean_entity_name(raw: str) -> str:
+    """Strip leading sentence/label noise and a trailing bare 'No' from a name."""
+    words = raw.strip().rstrip(".,;:").split()
+    while words and words[0].lower().strip(".,;:") in _LEADING_NOISE:
+        words.pop(0)
+    while words and words[-1].lower().strip(".") == "no":
+        words.pop()
+    return " ".join(words)
+
+
+def _looks_like_entity(norm: str) -> bool:
+    """False for empty/too-short names and names made entirely of defined terms."""
+    tokens = norm.split()
+    if not tokens or len(norm) < 3:
+        return False
+    # All tokens are generic defined-term/concept words → not an entity.
+    return not all(t in _DEFINED_TERMS for t in tokens)
+
 
 def _extract_entities_from_entry(entry: Entry) -> list[tuple[str, str]]:
-    """Extract (raw_entity_name, source_document) from an entry."""
+    """Extract (raw_entity_name, source_document) from an entry.
+
+    Leading sentence/label words are stripped and pure defined-term/concept
+    names are dropped, so the resolver sees actual entity names rather than
+    Title-Cased legal boilerplate.
+    """
     if not entry.content:
         return []
     doc = entry.source.document if entry.source else ""
     entities = []
     seen = set()
     for m in _ORG_LIKE.finditer(entry.content):
-        name = m.group(1).strip().rstrip(".,;:")
+        name = _clean_entity_name(m.group(1))
         if len(name) < 5 or len(name) > 80:
             continue
-        # Skip generic words
-        lower = name.lower()
-        if lower in {"the company", "the firm", "the bank", "the issuer",
-                      "the borrower", "the lender", "the agent", "section",
-                      "article", "schedule", "exhibit"}:
+        if not _looks_like_entity(_normalize_entity(name)):
             continue
-        key = lower
+        key = name.lower()
         if key not in seen:
             seen.add(key)
             entities.append((name, doc))
@@ -302,14 +368,10 @@ def resolve_entities(
     if len(occurrences) < 2:
         return ResolutionResult([], [], [], 0)
 
-    # 2. Deduplicate exact-normalized matches (same entity, different entries)
-    exact_clusters: list[list[dict]] = []
-    for norm, occs in seen_norm.items():
-        if len(occs) >= 2:
-            # Different entries or different docs mentioning same entity
-            exact_clusters.append(occs)
-
-    # 3. Fuzzy matching between distinct normalized names
+    # 2. Fuzzy matching between distinct normalized names. Exact-normalized
+    # duplicates are handled by the unified clusterer below (a single norm with
+    # >1 distinct surface form is an exact cluster), so they are NOT collected
+    # separately — doing both previously double-created resolution entries.
     unique_norms: list[tuple[str, list[dict]]] = []
     for norm, occs in seen_norm.items():
         unique_norms.append((norm, occs))
@@ -325,6 +387,11 @@ def resolve_entities(
             tokens_i = set(norm_i.split())
             tokens_j = set(norm_j.split())
             if not (tokens_i & tokens_j):
+                continue
+
+            # Skip pure singular/plural variants of the same term — the same
+            # defined term written two ways, not a cross-document entity variant.
+            if _depluralize(norm_i) == _depluralize(norm_j):
                 continue
 
             jw = _jaro_winkler(norm_i, norm_j)
@@ -371,15 +438,15 @@ def resolve_entities(
                 confidence=confidence,
             ))
 
-    # 4. Cluster matches (union-find)
+    # 3. Cluster (union-find over norms) — unifies exact + fuzzy and dedupes,
+    #    so each distinct entity set yields exactly one resolution entry.
     clusters = _cluster_matches(match_pairs, seen_norm)
 
-    # 5. Create blackboard entries for each cluster (fuzzy + exact)
-    all_clusters = clusters + exact_clusters
-    created = _create_resolution_entries(blackboard, all_clusters, match_pairs)
+    # 4. Create one blackboard entry per cluster.
+    created = _create_resolution_entries(blackboard, clusters, match_pairs)
 
     return ResolutionResult(
-        clusters=all_clusters,
+        clusters=clusters,
         match_pairs=match_pairs,
         entries_created=created,
         tokens_used=0,
@@ -411,36 +478,61 @@ def _cluster_matches(
     match_pairs: list[MatchResult],
     seen_norm: dict[str, list[dict]],
 ) -> list[list[dict]]:
-    """Group matched entities into clusters using union-find."""
+    """Group entity occurrences into clusters with union-find over norms.
+
+    Unifies two cases into one deduped pass:
+    - exact clusters: one normalized form with >1 distinct surface form
+      (e.g. "Pinnacle Industrial Solutions, Inc." vs "...Solutions");
+    - fuzzy clusters: distinct norms joined by an above-threshold match pair.
+
+    A cluster is returned only if it holds more than one distinct surface form —
+    repeating the identical string is not a resolution.
+    """
     uf = _UnionFind()
+    for norm in seen_norm:
+        uf.find(norm)  # ensure every norm is a node, even with no match pair
     for pair in match_pairs:
         uf.union(pair.norm_a, pair.norm_b)
 
     groups: dict[str, list[dict]] = {}
-    for norm in seen_norm:
+    for norm, occs in seen_norm.items():
         root = uf.find(norm)
-        groups.setdefault(root, [])
-        for occ in seen_norm[norm]:
-            # Avoid duplicates
+        bucket = groups.setdefault(root, [])
+        for occ in occs:
             if not any(o["entry_id"] == occ["entry_id"] and o["raw"] == occ["raw"]
-                       for o in groups[root]):
-                groups[root].append(occ)
+                       for o in bucket):
+                bucket.append(occ)
 
-    # Only return clusters with >1 distinct normalized form
-    return [members for members in groups.values()
-            if len({m["norm"] for m in members}) > 1]
+    return [
+        members for members in groups.values()
+        if len({m["raw"].strip().lower() for m in members}) > 1
+    ]
 
 
 # ---------------------------------------------------------------------------
 # Blackboard entry creation
 # ---------------------------------------------------------------------------
 
+def _canonical_name(cluster: list[dict]) -> str:
+    """Most frequent surface form in a cluster, tie-broken by length."""
+    freq = Counter(o["raw"].strip() for o in cluster if o["raw"].strip())
+    if not freq:
+        return ""
+    return max(freq.items(), key=lambda kv: (kv[1], len(kv[0])))[0]
+
+
 def _create_resolution_entries(
     blackboard: Blackboard,
     clusters: list[list[dict]],
     match_pairs: list[MatchResult],
 ) -> list[Entry]:
-    """Add entity-resolution mapping entries to the blackboard."""
+    """Add one entity-resolution entry per cluster.
+
+    Exact-normalized clusters (same entity differing only by punctuation or a
+    legal suffix) are asserted with high confidence. Fuzzy clusters are framed
+    as CANDIDATES for review with calibrated, lower confidence — deterministic
+    similarity cannot guarantee similar-but-distinct names are one entity.
+    """
     created: list[Entry] = []
     worker = WorkerRecord(
         worker_id="entity_resolution",
@@ -449,42 +541,55 @@ def _create_resolution_entries(
     )
 
     for cluster in clusters:
-        if len(cluster) < 2:
-            continue
-
-        # Pick the longest normalized name as canonical
-        canonical = max(cluster, key=lambda c: len(c["norm"]))
-        variants = [c for c in cluster if c["raw"] != canonical["raw"]]
-
+        canonical = _canonical_name(cluster)
+        variants = sorted(
+            {o["raw"].strip() for o in cluster if o["raw"].strip()} - {canonical}
+        )
         if not variants:
             continue
 
-        # Build a content string listing all name variants and their sources
-        variant_lines = []
-        for v in variants:
-            doc_tag = f" (from {v['doc']})" if v["doc"] else ""
-            variant_lines.append(f"- \"{v['raw']}\"{doc_tag}")
+        distinct_norms = {c["norm"] for c in cluster}
+        is_exact = len(distinct_norms) == 1
 
-        content = (
-            f"ENTITY RESOLUTION: \"{canonical['raw']}\" appears under "
-            f"{len(cluster)} name variant(s) across documents:\n"
-            + "\n".join(variant_lines)
-            + f"\nCanonical form: \"{canonical['raw']}\""
-            + "\nThese likely refer to the same entity and should be "
-            "cross-referenced in all analysis."
-        )
-
-        # Find the best match pair for this cluster to get composite score
         best_composite = 0.0
         for pair in match_pairs:
-            cluster_norms = {c["norm"] for c in cluster}
-            if pair.norm_a in cluster_norms and pair.norm_b in cluster_norms:
+            if pair.norm_a in distinct_norms and pair.norm_b in distinct_norms:
                 best_composite = max(best_composite, pair.composite)
 
-        # Exact-normalization clusters (all norms identical) get high confidence
-        distinct_norms = {c["norm"] for c in cluster}
-        if len(distinct_norms) == 1:
-            best_composite = max(best_composite, 0.92)
+        variant_lines = []
+        for v in variants:
+            v_docs = sorted({o["doc"] for o in cluster
+                             if o["raw"].strip() == v and o["doc"]})
+            doc_tag = f" (from {', '.join(v_docs)})" if v_docs else ""
+            variant_lines.append(f'- "{v}"{doc_tag}')
+
+        if is_exact:
+            best_composite = max(best_composite, 0.95)
+            confidence = 0.9
+            header = (
+                f'ENTITY RESOLUTION: "{canonical}" appears under '
+                f"{len(variants) + 1} surface form(s) (identical after "
+                "normalization):"
+            )
+            note = ("These are the same entity written differently and should "
+                    "be cross-referenced in all analysis.")
+            kind = "exact"
+        else:
+            confidence = round(min(0.7, best_composite or 0.6), 2)
+            header = (
+                f'ENTITY RESOLUTION (CANDIDATE): "{canonical}" may be the same '
+                f"entity as {len(variants)} similar name(s):"
+            )
+            note = ("Similar but NOT identical after normalization — review "
+                    "before merging. String similarity cannot distinguish a "
+                    "true variant (Petrochem/Petrochemical) from distinct "
+                    "entities that merely share a prefix (Petrochem/Petroleum).")
+            kind = "candidate"
+
+        content = (
+            header + "\n" + "\n".join(variant_lines)
+            + f'\nCanonical form: "{canonical}"\n' + note
+        )
 
         entry = Entry(
             id=gen_entry_id(),
@@ -493,14 +598,15 @@ def _create_resolution_entries(
             source=EntrySource(
                 document="; ".join(sorted({c["doc"] for c in cluster if c["doc"]})),
                 section="cross_document",
-                evidence=f"Entity resolution: {len(cluster)} variants detected "
+                evidence=f"Entity resolution ({kind}): {len(variants) + 1} forms "
                          f"(composite={best_composite:.3f})",
             ),
             created_by=worker,
-            confidence=min(0.95, best_composite + 0.05),
+            confidence=confidence,
             tags=[
                 "entity_resolution",
-                f"variant_count:{len(cluster)}",
+                kind,
+                f"variant_count:{len(variants) + 1}",
                 f"composite:{best_composite:.3f}",
             ],
             status="active",
@@ -530,7 +636,7 @@ def run_entity_resolution(blackboard: Blackboard, **kwargs) -> dict:
         "tokens_used": 0,
         "clusters": [
             {
-                "canonical": max(c, key=lambda x: len(x["norm"]))["raw"],
+                "canonical": _canonical_name(c),
                 "variants": [
                     {"raw": m["raw"], "doc": m["doc"], "entry_id": m["entry_id"]}
                     for m in c
