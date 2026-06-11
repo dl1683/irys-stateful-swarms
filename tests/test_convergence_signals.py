@@ -292,3 +292,24 @@ class TestEdgeCases:
         s = _mk_snapshot(3, 50, open_signals=0, addressed_signals=15)
         score = compute_convergence_score([_mk_snapshot(0, 0), _mk_snapshot(1, 20), s])
         assert score.signal_resolution_rate == 1.0
+
+    def test_cross_doc_coverage_clamped(self):
+        # documents_with_entries can exceed total_documents in a hand-built
+        # snapshot; coverage must never exceed 1.0.
+        s = _mk_snapshot(3, 40, documents_with_entries=5, total_documents=2)
+        score = compute_convergence_score(
+            [_mk_snapshot(0, 0), _mk_snapshot(1, 20), s]
+        )
+        assert score.cross_doc_coverage == 1.0
+
+    def test_plateau_after_early_spike_is_not_gaining(self):
+        # A burst of entries early, then two flat iterations, must register as
+        # decelerating (not "still gaining") despite the stale early spike.
+        snaps = [
+            _mk_snapshot(0, 0),
+            _mk_snapshot(1, 200),
+            _mk_snapshot(2, 200),
+            _mk_snapshot(3, 200),
+        ]
+        score = compute_convergence_score(snaps)
+        assert score.gain_deceleration >= 0.7

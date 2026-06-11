@@ -57,6 +57,13 @@ def take_snapshot(blackboard: Blackboard) -> IterationSnapshot:
         if e.source and e.source.document:
             docs_with_entries.add(e.source.document)
 
+    # Total documents "in play" = registered documents UNION any document a
+    # live entry cites. Counting only blackboard.documents understates the
+    # denominator when entries reference docs that were never registered, which
+    # let cross_doc_coverage exceed 1.0. The union guarantees
+    # documents_with_entries <= total_documents.
+    all_docs = {d.name for d in blackboard.documents if d.name} | docs_with_entries
+
     open_sigs = sum(1 for s in blackboard.signals if s.status == "open")
     addressed_sigs = sum(1 for s in blackboard.signals if s.status == "addressed")
 
@@ -76,7 +83,7 @@ def take_snapshot(blackboard: Blackboard) -> IterationSnapshot:
         mean_confidence=round(mean_c, 4),
         std_confidence=round(std_c, 4),
         documents_with_entries=len(docs_with_entries),
-        total_documents=len(blackboard.documents),
+        total_documents=len(all_docs),
         analysis_entries=type_counts.get("analysis", 0),
         calculation_entries=type_counts.get("calculation", 0),
         gap_entries=type_counts.get("gap", 0),
@@ -106,6 +113,13 @@ MIN_ITERATIONS_FOR_CONVERGENCE = 2
 
 # Window size for rate-of-change calculations
 RATE_WINDOW = 3
+
+# Window for the information-gain rate. Deliberately short (2) so a genuine
+# plateau is detected promptly: deceleration compares the gain over the last
+# GAIN_RATE_WINDOW iterations against the peak windowed gain. A larger window
+# let a single early extraction spike contaminate the "current" rate and made
+# a flat blackboard read as still gaining.
+GAIN_RATE_WINDOW = 2
 
 # Thresholds
 GAIN_STOP_THRESHOLD = 0.05        # <5% of peak gain = stopped gaining
@@ -157,9 +171,10 @@ def compute_convergence_score(
     # 4. Type balance
     type_balance = _compute_type_balance(latest)
 
-    # 5. Cross-document coverage
+    # 5. Cross-document coverage (clamped: a hand-built snapshot can carry
+    # documents_with_entries > total_documents, which must not score > 1.0).
     cross_doc = (
-        latest.documents_with_entries / latest.total_documents
+        min(1.0, latest.documents_with_entries / latest.total_documents)
         if latest.total_documents > 0 else 1.0
     )
 
@@ -217,38 +232,43 @@ def _compute_gain_metrics(
     Returns:
         (current_gain_rate, deceleration)
         deceleration: 0 = still gaining fast, 1 = completely stopped.
+
+    Both the peak and the current rate are GAIN_RATE_WINDOW-wide moving
+    averages, each divided by the number of elements actually in the window
+    (never a fixed divisor), so a partial early window is not understated and
+    the two are directly comparable.
     """
     if len(snapshots) < 2:
         return 0.0, 0.0
 
-    # Compute gains (entries added per iteration)
-    gains = []
-    for i in range(1, len(snapshots)):
-        delta = snapshots[i].active_entries - snapshots[i - 1].active_entries
-        gains.append(max(0, delta))
-
+    # Gains = net active entries added per iteration (clamped at 0).
+    gains = [
+        max(0, snapshots[i].active_entries - snapshots[i - 1].active_entries)
+        for i in range(1, len(snapshots))
+    ]
     if not gains:
         return 0.0, 1.0
 
-    current_gain = gains[-1]
+    w = min(GAIN_RATE_WINDOW, len(gains))
 
-    # Peak gain (over any window)
-    window = min(RATE_WINDOW, len(gains))
+    def _window_avg(seq: list[int]) -> float:
+        return sum(seq) / len(seq) if seq else 0.0
+
+    # Peak windowed gain over the whole history (actual-length division so an
+    # early partial window is not divided by a larger fixed window size).
     peak_gain = max(
-        sum(gains[max(0, i - window + 1):i + 1]) / window
+        _window_avg(gains[max(0, i - w + 1):i + 1])
         for i in range(len(gains))
-    ) if gains else 0
+    )
 
-    # Current rate (average over last window)
-    recent = gains[-window:]
-    current_rate = sum(recent) / len(recent) if recent else 0
+    # Current rate = average gain over the last w iterations only, so stale
+    # early spikes do not mask a present-day plateau.
+    current_rate = _window_avg(gains[-w:])
 
-    # Deceleration: how much the current rate has slowed vs peak
-    if peak_gain <= 0:
-        deceleration = 1.0
-    else:
-        deceleration = max(0.0, 1.0 - (current_rate / peak_gain))
-
+    deceleration = (
+        1.0 if peak_gain <= 0
+        else max(0.0, 1.0 - (current_rate / peak_gain))
+    )
     return current_rate, deceleration
 
 
@@ -314,13 +334,15 @@ def should_force_converge(
 
     score = compute_convergence_score(snapshots)
 
-    # Budget pressure: if >75% used, converge if score is decent
-    if budget_pct >= 75 and score.overall >= 0.5:
-        return True, f"budget_pressure({budget_pct:.0f}%)_score({score.overall:.2f})"
-
-    # Budget emergency: if >90% used, always converge
+    # Budget emergency: if >=90% used, always converge. Checked BEFORE the
+    # lower pressure threshold so a decent score at >=90% still reports the
+    # emergency reason instead of being shadowed by the 75% branch.
     if budget_pct >= 90:
         return True, f"budget_emergency({budget_pct:.0f}%)"
+
+    # Budget pressure: if >=75% used, converge if the score is decent.
+    if budget_pct >= 75 and score.overall >= 0.5:
+        return True, f"budget_pressure({budget_pct:.0f}%)_score({score.overall:.2f})"
 
     # Strong convergence signal: all components good
     if (score.gain_deceleration >= 0.85
