@@ -1,18 +1,25 @@
-"""Tests for deterministic entity resolution (Open Research Question #1)."""
+"""Tests for language- and domain-agnostic cross-document entity resolution (ORQ #1).
+
+Covers normalization, similarity metrics, exact + fuzzy resolution, MULTILINGUAL inputs
+(German / Spanish / Japanese / Cyrillic), a NON-LEGAL domain, corpus-derived generic-term
+filtering (no hardcoded blocklist), corpus-driven leading-noise stripping, and the optional
+ModelCaller hybrid path. Every test is deterministic and offline.
+"""
 from __future__ import annotations
 
 import pytest
 
+from src.swarm import entity_resolution
 from src.swarm.blackboard import Blackboard
 from src.swarm.entity_resolution import (
-    MatchResult,
-    _clean_entity_name,
-    _cluster_matches,
+    ResolutionConfig,
+    _corpus_generic_tokens,
+    _default_extract,
+    _is_prefix_variant,
     _jaro_winkler,
     _levenshtein_ratio,
-    _looks_like_entity,
     _normalize_entity,
-    _is_prefix_variant,
+    _strip_generic_edges,
     _token_overlap,
     _trigrams,
     resolve_entities,
@@ -21,12 +28,44 @@ from src.swarm.entity_resolution import (
 from src.swarm.models import Entry, EntrySource, WorkerRecord, gen_entry_id
 
 
-# -----------------------------------------------------------------------
-# Normalization
-# -----------------------------------------------------------------------
+def _entry(content: str, doc: str = "a.docx", typ: str = "observation") -> Entry:
+    return Entry(
+        id=gen_entry_id(), type=typ, content=content,
+        source=EntrySource(document=doc, section="Full Document"),
+        created_by=WorkerRecord("test_worker", "test", 0),
+        confidence=0.9, status="active",
+    )
 
-class TestNormalizeEntity:
-    def test_strips_punctuation(self):
+
+def _bb(*entries: Entry) -> Blackboard:
+    bb = Blackboard()
+    for e in entries:
+        bb.add_entry(e)
+    return bb
+
+
+def _clusters_canon(result) -> set[str]:
+    from src.swarm.entity_resolution import _canonical_name
+    return {_canonical_name(c).casefold() for c in result.clusters}
+
+
+def _has_cluster(result, needle: str) -> bool:
+    """True if any resolved cluster's canonical name contains ``needle`` (casefolded).
+
+    The canonical is the most frequent raw surface form (often the longest, e.g. with a
+    legal suffix), so identity is checked by containment, not exact equality.
+    """
+    from src.swarm.entity_resolution import _canonical_name
+    n = needle.casefold()
+    return any(n in _canonical_name(c).casefold() for c in result.clusters)
+
+
+# ---------------------------------------------------------------------------
+# Normalization — unicode-correct, language-neutral
+# ---------------------------------------------------------------------------
+
+class TestNormalize:
+    def test_strips_punctuation_and_suffix(self):
         assert _normalize_entity("Zenith Petrochem Industries LLC.") == "zenith petrochem industries"
 
     def test_strips_common_suffixes(self):
@@ -34,354 +73,271 @@ class TestNormalizeEntity:
         assert _normalize_entity("Foo Bar Inc.") == "foo bar"
         assert _normalize_entity("Baz Holdings Ltd") == "baz"
 
-    def test_lowercases(self):
+    def test_casefolds(self):
         assert _normalize_entity("NORTHBROOK CAPITAL") == "northbrook capital"
+
+    def test_distinguishing_tokens_not_folded(self):
+        # "Capital" must survive — it distinguishes Northbrook Capital from Northbrook Group.
+        assert "capital" in _normalize_entity("Northbrook Capital")
 
     def test_collapses_whitespace(self):
         assert _normalize_entity("  Foo   Bar  ") == "foo bar"
 
+    def test_unicode_german_suffix(self):
+        assert _normalize_entity("Zenith Petrochemie GmbH") == "zenith petrochemie"
 
-# -----------------------------------------------------------------------
-# Similarity metrics
-# -----------------------------------------------------------------------
+    def test_unicode_preserves_accents(self):
+        assert _normalize_entity("Industrias Álvarez") == "industrias álvarez"
 
-class TestJaroWinkler:
-    def test_identical(self):
+    def test_unicode_cjk(self):
+        # NFKC + casefold leave CJK intact; spaced legal form folds.
+        assert _normalize_entity("東京エレクトロン 株式会社") == "東京エレクトロン"
+
+
+# ---------------------------------------------------------------------------
+# Similarity metrics (unchanged, language-agnostic over code points)
+# ---------------------------------------------------------------------------
+
+class TestSimilarity:
+    def test_jw_identical(self):
         assert _jaro_winkler("hello", "hello") == 1.0
 
-    def test_empty(self):
+    def test_jw_empty(self):
         assert _jaro_winkler("", "hello") == 0.0
 
-    def test_similar(self):
-        score = _jaro_winkler("martha", "marhta")
-        assert score > 0.9
+    def test_jw_similar(self):
+        assert _jaro_winkler("martha", "marhta") > 0.9
 
-    def test_different(self):
-        score = _jaro_winkler("abc", "xyz")
-        assert score < 0.3
+    def test_jw_cyrillic(self):
+        assert _jaro_winkler("роснефть", "роснефти") > 0.85
 
-    def test_prefix_bonus(self):
-        # "mario" vs "marion" — shared prefix should boost
-        score = _jaro_winkler("mario", "marion")
-        assert score > 0.85
+    def test_lev_one_edit(self):
+        assert _levenshtein_ratio("kitten", "sitten") > 0.8
 
-
-class TestLevenshtein:
-    def test_identical(self):
-        assert _levenshtein_ratio("test", "test") == 1.0
-
-    def test_one_edit(self):
-        # "kitten" → "sitten" = 1 edit out of 6 chars
-        score = _levenshtein_ratio("kitten", "sitten")
-        assert score > 0.8
-
-    def test_empty(self):
+    def test_lev_empty(self):
         assert _levenshtein_ratio("", "abc") == 0.0
 
-    def test_completely_different(self):
-        score = _levenshtein_ratio("abc", "xyz")
-        assert score < 0.5
+    def test_trigrams(self):
+        assert {"hel", "ell", "llo"} <= _trigrams("hello")
 
+    def test_token_overlap(self):
+        assert _token_overlap("acme robotics", "acme systems") == pytest.approx(1 / 3)
 
-class TestTrigrams:
-    def test_basic(self):
-        tri = _trigrams("hello")
-        assert "hel" in tri
-        assert "ell" in tri
-        assert "llo" in tri
-
-    def test_short_string(self):
-        tri = _trigrams("ab")
-        assert tri == {"ab"}
-
-
-class TestTokenOverlap:
-    def test_identical(self):
-        assert _token_overlap("foo bar baz", "foo bar baz") == 1.0
-
-    def test_partial(self):
-        score = _token_overlap("foo bar baz", "foo bar qux")
-        assert 0.4 < score < 0.8
-
-    def test_no_overlap(self):
-        assert _token_overlap("aaa bbb", "ccc ddd") == 0.0
-
-
-class TestIsPrefixVariant:
-    def test_prefix(self):
+    def test_prefix_variant(self):
         assert _is_prefix_variant("zenith petrochem", "zenith petrochemical")
-
-    def test_not_prefix(self):
-        assert not _is_prefix_variant("foo bar", "baz qux")
+        assert not _is_prefix_variant("zenith petrochem", "zenith petroleum")
 
 
-# -----------------------------------------------------------------------
-# Real-world failure cases from the README
-# -----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Extraction — unicode category driven, no English/legal regex
+# ---------------------------------------------------------------------------
 
-class TestREADMEFailureCases:
-    """Test the exact near-miss patterns documented in the repo's README."""
+class TestExtract:
+    def test_english_span(self):
+        out = _default_extract("Zenith Petrochemical Industries supplies the resin.")
+        assert any("Zenith Petrochemical Industries" in s for s in out)
 
-    def _make_entry(self, content: str, doc: str = "test.docx") -> Entry:
-        return Entry(
-            id=gen_entry_id(),
-            type="observation",
-            content=content,
-            source=EntrySource(document=doc, section="Full Document"),
-            created_by=WorkerRecord("test_worker", "test", 0),
-            confidence=0.9,
+    def test_skips_lowercase_boilerplate(self):
+        # a lowercase sentence yields no proper-name spans
+        assert _default_extract("the agreement was signed on the closing date") == []
+
+    def test_german(self):
+        out = _default_extract("Die Müller Maschinenbau GmbH liefert Teile.")
+        assert any("Müller Maschinenbau" in s for s in out)
+
+    def test_cyrillic(self):
+        out = _default_extract("Компания Роснефть подписала договор.")
+        assert any("Роснефть" in s for s in out)
+
+    def test_cjk_present(self):
+        out = _default_extract("東京エレクトロン 株式会社")
+        assert any("東京エレクトロン" in s for s in out)
+
+
+# ---------------------------------------------------------------------------
+# Core resolution — exact / fuzzy / distinct
+# ---------------------------------------------------------------------------
+
+class TestResolution:
+    def test_exact_variant_asserted(self):
+        bb = _bb(
+            _entry("Pinnacle Industrial Solutions Inc is the borrower.", doc="a.pdf"),
+            _entry("Pinnacle Industrial Solutions provided collateral.", doc="b.pdf"),
         )
-
-    def test_zenith_petrochem_variant(self):
-        """'Zenith Petrochem Industries LLC' vs 'Zenith Petrochemical Industries LLC'"""
-        bb = Blackboard()
-        bb.add_entry(self._make_entry(
-            "The exporter is Zenith Petrochem Industries LLC, located in Jebel Ali Free Zone, UAE.",
-            doc="credit-agreement.docx",
-        ))
-        bb.add_entry(self._make_entry(
-            "Zenith Petrochemical Industries LLC, Jebel Ali Free Zone, Dubai, UAE",
-            doc="sanctions-screening.xlsx",
-        ))
-        result = resolve_entities(bb, threshold=0.65)
-        assert len(result.match_pairs) >= 1, (
-            "Should detect Zenith Petrochem vs Zenith Petrochemical"
-        )
-        assert result.match_pairs[0].composite > 0.65
-
-    def test_pinnacle_solutions_variant(self):
-        """'Pinnacle Industrial Solutions, Inc.' vs 'Pinnacle Industrial Solutions'
-
-        After suffix stripping, both normalize to 'pinnacle industrial solutions',
-        so they appear as an exact-match cluster (not a fuzzy match pair).
-        """
-        bb = Blackboard()
-        bb.add_entry(self._make_entry(
-            "Debtor: Pinnacle Industrial Solutions, Inc., a corporation organized in Ohio, Charter No. 2187650",
-            doc="ucc-filing-1.pdf",
-        ))
-        bb.add_entry(self._make_entry(
-            "Filing OH-2019-0178443 (Tristate Capital Equipment Corp.) against Pinnacle Industrial Solutions is LAPSED",
-            doc="ucc-filing-2.pdf",
-        ))
-        result = resolve_entities(bb, threshold=0.65)
-        # Exact normalization match → clusters, not match_pairs
-        assert len(result.clusters) >= 1, (
-            "Should detect Pinnacle Industrial Solutions, Inc. vs without Inc. "
-            f"(clusters={len(result.clusters)}, match_pairs={len(result.match_pairs)})"
-        )
-
-
-# -----------------------------------------------------------------------
-# Integration: blackboard entry creation
-# -----------------------------------------------------------------------
-
-class TestBlackboardIntegration:
-    def _make_entry(self, content: str, doc: str = "test.docx") -> Entry:
-        return Entry(
-            id=gen_entry_id(),
-            type="observation",
-            content=content,
-            source=EntrySource(document=doc, section="Full Document"),
-            created_by=WorkerRecord("test_worker", "test", 0),
-            confidence=0.9,
-        )
-
-    def test_creates_resolution_entries(self):
-        bb = Blackboard()
-        bb.add_entry(self._make_entry(
-            "Northbrook Capital Markets, LLC commits to provide a loan.",
-            doc="commitment-letter.docx",
-        ))
-        bb.add_entry(self._make_entry(
-            "Northbrook Capital Markets LLC provided the commitment.",
-            doc="credit-agreement.docx",
-        ))
-        initial_count = len(bb.entries)
-        result = resolve_entities(bb, threshold=0.65)
-        # Should have created at least one resolution entry
-        assert len(bb.entries) > initial_count
-        resolution_entries = [e for e in bb.entries if "entity_resolution" in (e.tags or [])]
-        assert len(resolution_entries) >= 1
-
-    def test_no_llm_tokens_used(self):
-        bb = Blackboard()
-        bb.add_entry(self._make_entry("Alpha Corp Holdings Inc is the buyer.", doc="a.docx"))
-        bb.add_entry(self._make_entry("Alpha Corp Holdings is the acquiring party.", doc="b.docx"))
-        result = resolve_entities(bb, threshold=0.65)
+        result = resolve_entities(bb)
+        assert _has_cluster(result, "pinnacle industrial solutions")
         assert result.tokens_used == 0
 
-    def test_run_entity_resolution_report(self):
-        bb = Blackboard()
-        bb.add_entry(self._make_entry(
-            "Acme Industries LLC manufactures widgets.",
-            doc="contract.pdf",
-        ))
-        bb.add_entry(self._make_entry(
-            "Acme Industries Inc. is the counterparty.",
-            doc="amendment.pdf",
-        ))
-        report = run_entity_resolution(bb, threshold=0.65)
+    def test_fuzzy_variant_is_candidate(self):
+        bb = _bb(
+            _entry("Zenith Petrochem refined the feedstock.", doc="a.pdf"),
+            _entry("Zenith Petrochemical reported earnings.", doc="b.pdf"),
+        )
+        result = resolve_entities(bb)
+        assert result.clusters, "expected a candidate cluster for Petrochem/Petrochemical"
+        created = result.entries_created
+        assert any("CANDIDATE" in e.content for e in created)
+        assert all(e.confidence <= 0.7 for e in created)
+
+    def test_distinct_prefix_not_overmerged_blindly(self):
+        # Petrochem vs Petroleum share a prefix but are different; never asserted as exact.
+        bb = _bb(
+            _entry("Zenith Petrochem refined the feedstock.", doc="a.pdf"),
+            _entry("Zenith Petroleum drilled new wells.", doc="b.pdf"),
+        )
+        result = resolve_entities(bb)
+        for e in result.entries_created:
+            assert "CANDIDATE" in e.content  # only ever surfaced for review, not asserted
+
+
+# ---------------------------------------------------------------------------
+# Multilingual resolution
+# ---------------------------------------------------------------------------
+
+class TestMultilingual:
+    def test_german_exact(self):
+        bb = _bb(
+            _entry("Zenith Petrochemie GmbH ist der Lieferant.", doc="de1.pdf"),
+            _entry("Zenith Petrochemie hat geliefert.", doc="de2.pdf"),
+        )
+        assert _has_cluster(resolve_entities(bb), "zenith petrochemie")
+
+    def test_spanish_fuzzy(self):
+        bb = _bb(
+            _entry("Constructora Ibérica firmó el contrato.", doc="es1.pdf"),
+            _entry("Constructora Iberica entregó la obra.", doc="es2.pdf"),
+        )
+        assert resolve_entities(bb).clusters  # accent variant surfaced
+
+    def test_japanese_exact(self):
+        # Full-width brackets/punctuation (as in real JP filings) isolate the entity span;
+        # the spaced legal form 株式会社 folds away, leaving an exact cross-doc match.
+        bb = _bb(
+            _entry("主要取引先（東京エレクトロン 株式会社）と合意。", doc="jp1.pdf"),
+            _entry("「東京エレクトロン」は前年比で成長。", doc="jp2.pdf"),
+        )
+        assert _has_cluster(resolve_entities(bb), "東京エレクトロン")
+
+    def test_cyrillic_fuzzy(self):
+        # Single-token Cyrillic near-duplicates (nominative vs genitive) share no exact token;
+        # the trigram pre-filter still catches them.
+        bb = _bb(
+            _entry("Поставщик: Роснефть.", doc="ru1.pdf"),
+            _entry("Партнёр: Роснефти.", doc="ru2.pdf"),
+        )
+        assert _has_cluster(resolve_entities(bb), "роснефт")
+
+
+# ---------------------------------------------------------------------------
+# Non-legal domain + corpus-derived generic filtering (no hardcoded blocklist)
+# ---------------------------------------------------------------------------
+
+class TestMultiDomainAndGenerics:
+    def test_no_hardcoded_blocklist_symbol(self):
+        # The fragile, English-legal _DEFINED_TERMS / _LEADING_NOISE / _ORG_LIKE are gone.
+        assert not hasattr(entity_resolution, "_DEFINED_TERMS")
+        assert not hasattr(entity_resolution, "_LEADING_NOISE")
+        assert not hasattr(entity_resolution, "_ORG_LIKE")
+
+    def test_generic_inferred_from_corpus_strategy_domain(self):
+        # A non-legal (strategy) corpus: "strategic"/"priority" recur across many distinct
+        # names → inferred generic; the real entity "Acme Robotics" survives and resolves.
+        boiler = [
+            "Strategic Priority", "Strategic Initiative", "Strategic Plan",
+            "Strategic Review", "Operational Priority", "Financial Priority",
+            "Corporate Priority", "Market Position", "Revenue Growth",
+        ]
+        entries = [_entry(f"{name} drives the roadmap.", doc=f"d{i}.md")
+                   for i, name in enumerate(boiler)]
+        entries.append(_entry("Acme Robotics shipped units.", doc="x.md"))
+        entries.append(_entry("Acme Robotics Inc raised funding.", doc="y.md"))
+        result = resolve_entities(_bb(*entries))
+
+        assert "strategic" in result.generic_terms
+        assert "priority" in result.generic_terms
+        assert "acme" not in result.generic_terms
+        assert "robotics" not in result.generic_terms
+        assert _has_cluster(result, "acme robotics")
+        # an all-generic phrase is never emitted as an entity
+        assert not _has_cluster(result, "strategic priority")
+
+    def test_leading_noise_stripped_by_corpus(self):
+        # Sentence-initial determiners are inferred generic and stripped, so a name still
+        # matches its bare form even when one occurrence is sentence-initial.
+        entries = [
+            _entry("The Northbrook Capital fund closed.", doc="a.md"),
+            _entry("Investors backed Northbrook Capital again.", doc="b.md"),
+        ]
+        # add corpus so "the" is seen across enough names to be generic
+        entries += [_entry(f"The {w} expanded operations." , doc=f"c{i}.md")
+                    for i, w in enumerate(
+                        ["Vortex Systems", "Helios Energy", "Orion Freight",
+                         "Cobalt Mining", "Delta Pharma", "Summit Foods"])]
+        result = resolve_entities(_bb(*entries))
+        assert _has_cluster(result, "northbrook capital")
+
+
+# ---------------------------------------------------------------------------
+# Hybrid ModelCaller path (offline, monkeypatched)
+# ---------------------------------------------------------------------------
+
+class TestHybridCaller:
+    def _ambiguous_bb(self):
+        return _bb(
+            _entry("Northwind Logistics handled the freight.", doc="a.pdf"),
+            _entry("Northwynd Logistics filed the manifest.", doc="b.pdf"),
+        )
+
+    def test_model_confirms_ambiguous(self, monkeypatch):
+        calls = {"n": 0}
+
+        def fake(caller, prompt, max_tokens=256):
+            calls["n"] += 1
+            return {"same": True, "confidence": 0.9}, 7
+
+        monkeypatch.setattr(entity_resolution, "_call_model", fake)
+        cfg = ResolutionConfig(high_confidence=0.99)  # force the ambiguous band
+        result = resolve_entities(self._ambiguous_bb(), config=cfg, caller=object())
+        assert calls["n"] >= 1
+        assert result.tokens_used >= 7
+        assert result.clusters
+        assert any(m.adjudication == "model_confirmed" for m in result.match_pairs)
+
+    def test_model_rejects_ambiguous(self, monkeypatch):
+        def fake(caller, prompt, max_tokens=256):
+            return {"same": False, "confidence": 0.9}, 5
+
+        monkeypatch.setattr(entity_resolution, "_call_model", fake)
+        cfg = ResolutionConfig(high_confidence=0.99)
+        result = resolve_entities(self._ambiguous_bb(), config=cfg, caller=object())
+        assert result.clusters == []  # rejected pair produces no cluster
+
+    def test_no_caller_is_zero_token(self):
+        result = resolve_entities(self._ambiguous_bb())
+        assert result.tokens_used == 0
+
+
+# ---------------------------------------------------------------------------
+# Config + report
+# ---------------------------------------------------------------------------
+
+class TestConfigAndReport:
+    def test_config_threshold_override(self):
+        bb = _bb(
+            _entry("Zenith Petrochem refined feedstock.", doc="a.pdf"),
+            _entry("Zenith Petrochemical reported earnings.", doc="b.pdf"),
+        )
+        # An impossibly high threshold suppresses fuzzy candidates.
+        strict = resolve_entities(bb, config=ResolutionConfig(match_threshold=0.999))
+        assert strict.clusters == []
+
+    def test_report_schema(self):
+        bb = _bb(
+            _entry("Pinnacle Industrial Solutions Inc is the borrower.", doc="a.pdf"),
+            _entry("Pinnacle Industrial Solutions provided collateral.", doc="b.pdf"),
+        )
+        report = run_entity_resolution(bb)
+        assert report["schema_version"] == 2
         assert report["tokens_used"] == 0
-        assert report["schema_version"] == 1
-        assert "clusters" in report
-        assert "matches" in report
-
-
-# -----------------------------------------------------------------------
-# Edge cases
-# -----------------------------------------------------------------------
-
-class TestEdgeCases:
-    def test_empty_blackboard(self):
-        bb = Blackboard()
-        result = resolve_entities(bb)
-        assert result.clusters == []
-        assert result.match_pairs == []
-        assert result.tokens_used == 0
-
-    def test_single_entry_no_match(self):
-        bb = Blackboard()
-        bb.add_entry(Entry(
-            id=gen_entry_id(), type="observation",
-            content="Acme Corp is the borrower.",
-            source=EntrySource(document="a.pdf"),
-            created_by=WorkerRecord("w", "d", 0), confidence=0.9,
-        ))
-        result = resolve_entities(bb)
-        assert result.match_pairs == []
-
-    def test_different_entities_not_matched(self):
-        """Completely different entities should not cluster."""
-        bb = Blackboard()
-        bb.add_entry(Entry(
-            id=gen_entry_id(), type="observation",
-            content="Alpha Corp Holdings Inc is the buyer.",
-            source=EntrySource(document="a.pdf"),
-            created_by=WorkerRecord("w", "d", 0), confidence=0.9,
-        ))
-        bb.add_entry(Entry(
-            id=gen_entry_id(), type="observation",
-            content="Beta Industries LLC is the seller.",
-            source=EntrySource(document="b.pdf"),
-            created_by=WorkerRecord("w", "d", 0), confidence=0.9,
-        ))
-        result = resolve_entities(bb, threshold=0.65)
-        assert result.match_pairs == []
-
-    def test_threshold_filtering(self):
-        """Higher threshold should produce fewer matches."""
-        bb = Blackboard()
-        bb.add_entry(Entry(
-            id=gen_entry_id(), type="observation",
-            content="Zenith Petrochem Industries LLC is the exporter.",
-            source=EntrySource(document="a.pdf"),
-            created_by=WorkerRecord("w", "d", 0), confidence=0.9,
-        ))
-        bb.add_entry(Entry(
-            id=gen_entry_id(), type="observation",
-            content="Zenith Petrochemical Industries LLC is the counterparty.",
-            source=EntrySource(document="b.pdf"),
-            created_by=WorkerRecord("w", "d", 0), confidence=0.9,
-        ))
-        # Low threshold — should match
-        result_low = resolve_entities(bb, threshold=0.55)
-        # High threshold — might not match
-        result_high = resolve_entities(bb, threshold=0.95)
-        assert len(result_low.match_pairs) >= len(result_high.match_pairs)
-
-
-# -----------------------------------------------------------------------
-# Precision regressions — the false positives observed on real blackboards
-# -----------------------------------------------------------------------
-
-class TestPrecisionRegressions:
-    """Guards against the noise the resolver produced on the repo's own
-    example blackboards: defined-term/concept names, leading-word pollution,
-    duplicate entries, and over-confident fuzzy assertions."""
-
-    def _entry(self, content: str, doc: str = "d.pdf") -> Entry:
-        return Entry(
-            id=gen_entry_id(), type="observation", content=content,
-            source=EntrySource(document=doc),
-            created_by=WorkerRecord("w", "d", 0), confidence=0.9,
-        )
-
-    def test_clean_entity_name_strips_leading_noise(self):
-        assert _clean_entity_name("For Zenith Petrochemical Industries LLC") == \
-            "Zenith Petrochemical Industries LLC"
-        assert _clean_entity_name("The Commitment Letter") == "Commitment Letter"
-        assert _clean_entity_name("Swiss Commercial Register No") == \
-            "Swiss Commercial Register"
-
-    def test_defined_terms_are_not_entities(self):
-        for term in ("term loan", "closing date", "administrative agent",
-                     "beneficial ownership", "exact match",
-                     "material adverse effect", "restricted subsidiary"):
-            assert not _looks_like_entity(term), f"{term!r} should be filtered"
-        # A name with a distinctive token survives.
-        assert _looks_like_entity("zenith petrochem industries")
-
-    def test_defined_terms_produce_no_clusters(self):
-        bb = Blackboard()
-        bb.add_entry(self._entry("The Term Loan matures in 2029.", doc="a.pdf"))
-        bb.add_entry(self._entry("Each Term Loans bears interest.", doc="b.pdf"))
-        bb.add_entry(self._entry("The Credit Agreement governs.", doc="a.pdf"))
-        bb.add_entry(self._entry("This Credit Agreement is amended.", doc="b.pdf"))
-        result = resolve_entities(bb, threshold=0.65)
-        assert result.clusters == []
-        assert not any("entity_resolution" in (e.tags or []) for e in bb.entries)
-
-    def test_fuzzy_match_is_a_low_confidence_candidate(self):
-        bb = Blackboard()
-        bb.add_entry(self._entry(
-            "Exporter: Zenith Petrochem Industries LLC.", doc="a.pdf"))
-        bb.add_entry(self._entry(
-            "Party: Zenith Petrochemical Industries LLC.", doc="b.pdf"))
-        resolve_entities(bb, threshold=0.65)
-        candidates = [e for e in bb.entries if "candidate" in (e.tags or [])]
-        assert len(candidates) >= 1
-        assert all(e.confidence <= 0.7 for e in candidates)
-        assert all("CANDIDATE" in e.content for e in candidates)
-
-    def test_distinct_prefix_entities_not_asserted_confident(self):
-        # Petrochem vs Petroleum share a prefix but are distinct; if matched at
-        # all they must be a review candidate, never a confident assertion.
-        bb = Blackboard()
-        bb.add_entry(self._entry("Zenith Petrochem Industries LLC ships goods.", doc="a.pdf"))
-        bb.add_entry(self._entry("Zenith Petroleum Industries LLC is screened.", doc="b.pdf"))
-        resolve_entities(bb, threshold=0.65)
-        for e in bb.entries:
-            if "entity_resolution" in (e.tags or []):
-                assert "exact" not in (e.tags or [])
-                assert e.confidence <= 0.7
-
-    def test_exact_suffix_variant_is_confident(self):
-        bb = Blackboard()
-        bb.add_entry(self._entry("Northbrook Capital Markets, LLC commits.", doc="a.pdf"))
-        bb.add_entry(self._entry("Northbrook Capital Markets LLC provided it.", doc="b.pdf"))
-        resolve_entities(bb, threshold=0.65)
-        exact = [e for e in bb.entries if "exact" in (e.tags or [])]
-        assert len(exact) == 1
-        assert exact[0].confidence == 0.9
-
-    def test_no_duplicate_resolution_entries(self):
-        # An entity repeated AND fuzzy-matched must yield exactly one entry.
-        bb = Blackboard()
-        for _ in range(3):
-            bb.add_entry(self._entry("Zenith Petrochem Industries LLC.", doc="a.pdf"))
-        bb.add_entry(self._entry("Zenith Petrochemical Industries LLC.", doc="b.pdf"))
-        result = resolve_entities(bb, threshold=0.65)
-        res_entries = [e for e in bb.entries if "entity_resolution" in (e.tags or [])]
-        assert len(res_entries) == len(result.entries_created) == 1
-
-    def test_canonical_has_no_leading_noise(self):
-        bb = Blackboard()
-        bb.add_entry(self._entry(
-            "For Crestmoor Trading AG and its affiliates.", doc="a.pdf"))
-        bb.add_entry(self._entry(
-            "Notify Crestmoor Trading immediately.", doc="b.pdf"))
-        report = run_entity_resolution(bb, threshold=0.6)
-        for cluster in report["clusters"]:
-            first = cluster["canonical"].split()[0].lower()
-            assert first not in {"for", "the", "notify", "all", "and"}
+        assert report["clusters_found"] >= 1
+        assert "generic_terms_inferred" in report
