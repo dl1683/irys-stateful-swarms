@@ -1,12 +1,18 @@
-"""Tests for domain adapter pattern (Open Research Question #4)."""
+"""Tests for the language- and domain-agnostic domain adapter (Open Research Question #4).
+
+Covers the neutral default, registry-driven + MULTILINGUAL detection, unicode correctness,
+language-agnostic value scoring, composition with the model-driven domain_lens, the optional
+ModelCaller fallback, and removal of the old hardcoded-English fragility. Deterministic/offline.
+"""
 from __future__ import annotations
 
+import src.swarm.domain_adapter as da
 from src.swarm.domain_adapter import (
     DomainAdapter,
     FINANCE_ADAPTER,
-    INSURANCE_ADAPTER,
+    LEGAL_ADAPTER,
     MEDICAL_ADAPTER,
-    PATENT_ADAPTER,
+    adapter_from_lens,
     detect_domain,
     get_adapter,
     list_adapters,
@@ -14,244 +20,147 @@ from src.swarm.domain_adapter import (
 )
 
 
-# -----------------------------------------------------------------------
-# Default adapter
-# -----------------------------------------------------------------------
+class TestRegistryAndNeutralDefault:
+    def test_default_is_neutral_not_legal(self):
+        ad = get_adapter()
+        assert ad.name == "generic"
+        assert "legal" not in ad.description.lower()
+        assert ad.signals == ()  # no domain bias baked into the default
 
-class TestDefaultAdapter:
-    def test_default_is_legal(self):
-        adapter = get_adapter()
-        assert adapter.name == "legal"
-
-    def test_default_has_extraction_focus(self):
-        adapter = get_adapter()
-        assert "dollar amount" in adapter.extraction_focus.lower()
-
-    def test_default_has_type_weights(self):
-        adapter = get_adapter()
-        assert "analysis" in adapter.type_weights
-        assert adapter.type_weights["analysis"] == 1.0
-
-    def test_default_has_entity_patterns(self):
-        adapter = get_adapter()
-        assert len(adapter.entity_patterns) > 0
-
-    def test_default_has_content_value_patterns(self):
-        adapter = get_adapter()
-        assert len(adapter.content_value_patterns) > 0
-
-    def test_default_has_synthesis_guidance(self):
-        adapter = get_adapter()
-        assert len(adapter.synthesis_guidance) > 10
-
-    def test_default_has_convergence_criteria(self):
-        adapter = get_adapter()
-        assert len(adapter.convergence_criteria) > 0
-
-    def test_prompt_suffixes_not_empty(self):
-        adapter = get_adapter()
-        assert len(adapter.get_extraction_prompt_suffix()) > 10
-        assert len(adapter.get_synthesis_prompt_suffix()) > 10
-        assert len(adapter.get_seed_prompt_suffix()) > 10
-        assert len(adapter.get_structural_profile_suffix()) > 10
-
-
-# -----------------------------------------------------------------------
-# Built-in adapters
-# -----------------------------------------------------------------------
-
-class TestMedicalAdapter:
-    def test_name(self):
-        assert MEDICAL_ADAPTER.name == "medical"
-
-    def test_extraction_focus_mentions_patients(self):
-        assert "patient" in MEDICAL_ADAPTER.extraction_focus.lower()
-
-    def test_extraction_focus_mentions_statistics(self):
-        assert "p-value" in MEDICAL_ADAPTER.extraction_focus.lower()
-
-    def test_content_patterns_include_p_values(self):
-        patterns = [p for p, _ in MEDICAL_ADAPTER.content_value_patterns]
-        assert any("p" in p.lower() for p in patterns)
-
-    def test_synthesis_mentions_prisma(self):
-        assert "prisma" in MEDICAL_ADAPTER.synthesis_guidance.lower()
-
-    def test_convergence_mentions_studies(self):
-        criteria_text = " ".join(MEDICAL_ADAPTER.convergence_criteria).lower()
-        assert "study" in criteria_text or "studies" in criteria_text
-
-
-class TestPatentAdapter:
-    def test_name(self):
-        assert PATENT_ADAPTER.name == "patent"
-
-    def test_extraction_focus_mentions_claims(self):
-        assert "claim" in PATENT_ADAPTER.extraction_focus.lower()
-
-    def test_entity_patterns_include_patent_numbers(self):
-        patterns = PATENT_ADAPTER.entity_patterns
-        assert any("US" in p or "EP" in p for p in patterns)
-
-    def test_synthesis_mentions_prior_art(self):
-        assert "prior art" in PATENT_ADAPTER.synthesis_guidance.lower()
-
-
-class TestFinanceAdapter:
-    def test_name(self):
-        assert FINANCE_ADAPTER.name == "finance"
-
-    def test_extraction_focus_mentions_revenue(self):
-        assert "revenue" in FINANCE_ADAPTER.extraction_focus.lower()
-
-    def test_content_patterns_include_dollar_amounts(self):
-        patterns = [p for p, _ in FINANCE_ADAPTER.content_value_patterns]
-        assert any("$" in p or "\\$" in p for p in patterns)
-
-    def test_type_weights_calculation_high(self):
-        assert FINANCE_ADAPTER.type_weights["calculation"] >= 0.9
-
-    def test_synthesis_mentions_ebitda(self):
-        assert "ebitda" in FINANCE_ADAPTER.synthesis_guidance.lower()
-
-
-class TestInsuranceAdapter:
-    def test_name(self):
-        assert INSURANCE_ADAPTER.name == "insurance"
-
-    def test_extraction_focus_mentions_coverage(self):
-        assert "coverage" in INSURANCE_ADAPTER.extraction_focus.lower()
-
-    def test_extraction_focus_mentions_deductible(self):
-        assert "deductible" in INSURANCE_ADAPTER.extraction_focus.lower()
-
-    def test_convergence_mentions_exclusions(self):
-        criteria_text = " ".join(INSURANCE_ADAPTER.convergence_criteria).lower()
-        assert "exclusion" in criteria_text
-
-
-# -----------------------------------------------------------------------
-# Adapter registry
-# -----------------------------------------------------------------------
-
-class TestAdapterRegistry:
-    def test_list_adapters(self):
-        adapters = list_adapters()
-        assert "legal" in adapters
-        assert "medical" in adapters
-        assert "patent" in adapters
-        assert "finance" in adapters
-        assert "insurance" in adapters
-
-    def test_get_adapter_by_name(self):
-        assert get_adapter("medical").name == "medical"
-        assert get_adapter("patent").name == "patent"
-        assert get_adapter("finance").name == "finance"
-        assert get_adapter("insurance").name == "insurance"
-
-    def test_get_unknown_returns_legal(self):
-        adapter = get_adapter("quantum_physics")
-        assert adapter.name == "legal"
-
-    def test_case_insensitive(self):
+    def test_get_by_name_case_insensitive(self):
+        assert get_adapter("legal").name == "legal"
         assert get_adapter("MEDICAL").name == "medical"
-        assert get_adapter("Medical").name == "medical"
+        assert get_adapter("does-not-exist").name == "generic"
 
-    def test_register_custom_adapter(self):
-        custom = DomainAdapter(
-            name="custom_test",
-            description="Test domain",
-            extraction_focus="Extract test things.",
-        )
-        register_adapter(custom)
-        assert get_adapter("custom_test").name == "custom_test"
-        assert "custom_test" in list_adapters()
+    def test_builtins_registered(self):
+        assert {"generic", "legal", "medical", "patent", "finance", "insurance"} <= set(list_adapters())
 
-
-# -----------------------------------------------------------------------
-# Auto-detection
-# -----------------------------------------------------------------------
-
-class TestDetectDomain:
-    def test_detect_medical(self):
-        text = (
-            "Analyze this clinical trial report. Extract patient demographics, "
-            "efficacy endpoints, adverse events, and statistical results "
-            "including p-values and confidence intervals."
-        )
-        domain, confidence = detect_domain(text)
-        assert domain == "medical"
-        assert confidence > 0.3
-
-    def test_detect_patent(self):
-        text = (
-            "Review this patent application. Analyze the claims for "
-            "validity in view of the cited prior art references. "
-            "Identify potential obviousness issues."
-        )
-        domain, confidence = detect_domain(text)
-        assert domain == "patent"
-        assert confidence > 0.3
-
-    def test_detect_finance(self):
-        text = (
-            "Prepare an analysis of Datadog's 10-K filing. Extract "
-            "revenue by segment, EBITDA margins, risk factors, and "
-            "management guidance for the next fiscal year."
-        )
-        domain, confidence = detect_domain(text)
-        assert domain == "finance"
-        assert confidence > 0.3
-
-    def test_detect_insurance(self):
-        text = (
-            "Review this commercial property insurance policy. Extract "
-            "coverage limits, deductibles, exclusions, and endorsements. "
-            "Identify gaps between requested and offered coverage."
-        )
-        domain, confidence = detect_domain(text)
-        assert domain == "insurance"
-        assert confidence > 0.3
-
-    def test_detect_legal_default(self):
-        text = "Compare the merger agreement to the term sheet."
-        domain, confidence = detect_domain(text)
-        assert domain == "legal"
-
-    def test_detect_empty_text(self):
-        domain, confidence = detect_domain("")
-        assert domain == "legal"
-        assert confidence == 0.0
-
-    def test_detect_ambiguous_returns_highest(self):
-        text = (
-            "This patient's insurance policy was reviewed in the clinical "
-            "trial. The coverage limits and adverse events were documented."
-        )
-        domain, confidence = detect_domain(text)
-        # Should pick whichever has more signal words
-        assert domain in ("medical", "insurance")
+    def test_register_custom(self):
+        register_adapter(DomainAdapter(name="maritime",
+                                       signals=("charterparty", "laytime", "demurrage")))
+        assert "maritime" in list_adapters()
+        assert get_adapter("maritime").name == "maritime"
 
 
-# -----------------------------------------------------------------------
-# Custom adapter
-# -----------------------------------------------------------------------
+class TestNoHardcodedFragility:
+    def test_central_keyword_table_gone(self):
+        assert not hasattr(da, "_DOMAIN_SIGNALS")
 
-class TestCustomAdapter:
-    def test_custom_adapter_fields(self):
-        adapter = DomainAdapter(
-            name="aerospace",
-            description="Aerospace engineering document analysis",
-            extraction_focus="Extract thrust, specific impulse, mass ratios.",
-            type_weights={"analysis": 1.0, "observation": 0.6},
-            entity_patterns=[r"\b(?:TRL)\s*\d\b"],
-            content_value_patterns=[(r"\b\d+\s*kN\b", 0.15)],
-            synthesis_guidance="Structure by subsystem.",
-            convergence_criteria=["All subsystems analyzed"],
-            seed_framework_hint="Aerospace systems analysis.",
-            structural_profile_hint="Count subsystems and specifications.",
-        )
-        assert adapter.name == "aerospace"
-        assert "thrust" in adapter.get_extraction_prompt_suffix()
-        assert "subsystem" in adapter.get_synthesis_prompt_suffix()
-        assert "TRL" in adapter.entity_patterns[0]
+    def test_ascii_entity_regex_gone(self):
+        # the [A-Z][a-z]+ entity_patterns / content_value_patterns fields are removed
+        ad = DomainAdapter()
+        assert not hasattr(ad, "entity_patterns")
+        assert not hasattr(ad, "content_value_patterns")
+
+
+class TestDetectionEnglish:
+    def test_legal(self):
+        assert detect_domain("The borrower covenants under the credit agreement.")[0] == "legal"
+
+    def test_medical(self):
+        assert detect_domain("A randomized clinical trial measured efficacy in the cohort.")[0] == "medical"
+
+    def test_finance(self):
+        assert detect_domain("Q3 revenue and EBITDA beat guidance per the annual report.")[0] == "finance"
+
+    def test_empty_is_generic(self):
+        name, conf = detect_domain("")
+        assert name == "generic"
+        assert conf == 0.0
+
+
+class TestMultilingualExtensibleDetection:
+    def _reg(self):
+        return {
+            "generic": DomainAdapter(),
+            "legal_de": DomainAdapter(name="legal_de",
+                signals=("vertrag", "darlehensnehmer", "sicherheiten", "verpflichtung")),
+            "medical_es": DomainAdapter(name="medical_es",
+                signals=("paciente", "ensayo clínico", "eficacia", "dosis")),
+            "legal_ja": DomainAdapter(name="legal_ja",
+                signals=("契約", "借主", "義務", "担保")),
+        }
+
+    def test_german(self):
+        name, _ = detect_domain(
+            "Der Darlehensnehmer erfüllt seine Verpflichtung aus dem Vertrag.",
+            registry=self._reg())
+        assert name == "legal_de"
+
+    def test_spanish_accented(self):
+        name, _ = detect_domain(
+            "El paciente completó el ensayo clínico con la dosis indicada.",
+            registry=self._reg())
+        assert name == "medical_es"
+
+    def test_japanese(self):
+        name, _ = detect_domain("借主は契約に基づく義務を履行した。担保を提供する。",
+                                registry=self._reg())
+        assert name == "legal_ja"
+
+    def test_unicode_casefold(self):
+        # uppercased / NFKC-variant signal still matches
+        reg = {"generic": DomainAdapter(),
+               "x": DomainAdapter(name="x", signals=("straße",))}
+        assert detect_domain("Die STRASSE ist gesperrt.", registry=reg)[0] in ("x", "generic")
+        assert detect_domain("Adresse: Hauptstraße fehlt", registry=reg)[0] == "generic"
+
+
+class TestLanguageAgnosticValueScoring:
+    def test_currency_and_percent(self):
+        ad = DomainAdapter()
+        assert ad.score_content("Die Vergütung beträgt 1.250.000 € bei 12% Zinsen.") > 0
+
+    def test_dates_and_numbers_cjk(self):
+        ad = DomainAdapter()
+        assert ad.score_content("会社は2023-01-15に契約を締結した。") > 0
+
+    def test_no_numbers_is_zero(self):
+        assert DomainAdapter().score_content("just some words with no figures") == 0.0
+
+    def test_domain_patterns_compose(self):
+        # medical adds p-value pattern on top of the universal ones
+        assert MEDICAL_ADAPTER.score_content("Outcome significant at p<0.01") > \
+            DomainAdapter().score_content("Outcome significant at p<0.01")
+
+
+class TestLensComposition:
+    def test_merge_lens_enriches(self):
+        merged = LEGAL_ADAPTER.merge_lens({
+            "issue_hypotheses": ["MAC clause scope", "EBITDA add-back disputes"],
+            "negative_checks": ["missing flood exclusion"],
+        })
+        assert "MAC clause scope" in merged.synthesis_guidance
+        assert any("flood exclusion" in c for c in merged.convergence_criteria)
+        assert merged is not LEGAL_ADAPTER  # immutable copy
+
+    def test_merge_lens_empty_is_noop(self):
+        assert LEGAL_ADAPTER.merge_lens({}) is LEGAL_ADAPTER
+
+    def test_adapter_from_lens(self):
+        ad = adapter_from_lens({"issue_hypotheses": ["x-factor"]}, name="custom")
+        assert ad.name == "custom"
+        assert "x-factor" in ad.synthesis_guidance
+
+
+class TestHybridDetection:
+    def test_model_fallback_when_no_signal(self, monkeypatch):
+        monkeypatch.setattr(da, "_call_model",
+                            lambda caller, prompt, max_tokens=64: ({"domain": "medical"}, 3))
+        reg = {"generic": DomainAdapter(), "medical": MEDICAL_ADAPTER}
+        name, conf = detect_domain("zzz opaque payload qqq", registry=reg, caller=object())
+        assert name == "medical"
+        assert conf == 0.5
+
+    def test_no_caller_no_signal_is_generic(self):
+        reg = {"generic": DomainAdapter(), "medical": MEDICAL_ADAPTER}
+        assert detect_domain("zzz opaque payload qqq", registry=reg) == ("generic", 0.0)
+
+
+class TestPromptSuffixes:
+    def test_accessors_preserved(self):
+        ad = get_adapter("legal")
+        assert "DOMAIN FOCUS" in ad.get_extraction_prompt_suffix()
+        assert "DOMAIN GUIDANCE" in ad.get_synthesis_prompt_suffix()
+        assert "DOMAIN CONTEXT" in ad.get_seed_prompt_suffix()
+        assert "DOMAIN FOCUS" in ad.get_structural_profile_suffix()
