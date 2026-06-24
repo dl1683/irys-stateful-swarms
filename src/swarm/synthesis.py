@@ -20,7 +20,7 @@ from .worker_dispatch import (
     call_model,
     end_call_model_usage,
     get_last_call_usage,
-    merge_call_usage,
+    set_last_call_usage,
 )
 
 
@@ -59,6 +59,19 @@ def render_entry(e: Entry, max_content: int = 400) -> str:
     return "".join(parts)
 
 
+def _finalize_synthesis_usage(usage_by_model: dict) -> None:
+    """Combine usage collected from parallel section drafts with whatever the
+    aggregate accumulated from sequential calls, then install it as the last
+    call's usage so blackboard.add_tokens_from_last_call picks up everything.
+    """
+    end_call_model_usage()
+    aggregate_usage, _, _, _ = get_last_call_usage()
+    combined: dict = {}
+    _merge_usage(combined, aggregate_usage)
+    _merge_usage(combined, usage_by_model)
+    set_last_call_usage(combined)
+
+
 def synthesize_deliverable(blackboard: Blackboard, must_include: list[dict],
                            caller: ModelCaller) -> tuple[str, int]:
     begin_call_model_usage()
@@ -69,12 +82,16 @@ def synthesize_deliverable(blackboard: Blackboard, must_include: list[dict],
 
         # If many items, use sectioned synthesis to avoid output truncation
         if used_sectioned:
-            draft, draft_tokens = _sectioned_synthesis(blackboard, must_include, active, caller)
+            draft, draft_tokens, usage_by_model = _sectioned_synthesis(
+                blackboard, must_include, active, caller,
+            )
         else:
             draft, draft_tokens = _draft_synthesis(blackboard, must_include, active, caller)
+            usage_by_model = {}
         total_tokens += draft_tokens
 
         if not must_include:
+            _finalize_synthesis_usage(usage_by_model)
             return draft, total_tokens
 
         # Phase 2: Verify — which must_include items are missing from the draft?
@@ -82,6 +99,7 @@ def synthesize_deliverable(blackboard: Blackboard, must_include: list[dict],
         total_tokens += verify_tokens
 
         if not missing:
+            _finalize_synthesis_usage(usage_by_model)
             return draft, total_tokens
 
         # Phase 3: Augment — targeted repair for missing items
@@ -101,6 +119,7 @@ def synthesize_deliverable(blackboard: Blackboard, must_include: list[dict],
         total_tokens += ph_tokens
         augmented = repaired_map.get("deliverable", augmented)
 
+        _finalize_synthesis_usage(usage_by_model)
         return augmented, total_tokens
     finally:
         end_call_model_usage()
@@ -149,7 +168,9 @@ def synthesize_file_deliverables(
 
         outputs: dict[str, str] = {}
         total_tokens = 0
+        usage_by_model: dict = {}
         if not filenames:
+            _finalize_synthesis_usage(usage_by_model)
             return outputs, total_tokens
 
         item_pool = _numbered_must_include_pool(must_include)
@@ -231,7 +252,9 @@ def synthesize_file_deliverables(
                 selected_items, plan["file_requirements"], filename,
             )
 
-            draft, draft_tokens = _draft_file_deliverable(
+            # _draft_file_deliverable's usage dict is already reflected in the
+            # call_model aggregate (same thread, sequential) — don't double-count it.
+            draft, draft_tokens, _ = _draft_file_deliverable(
                 blackboard, filename, plan["file_requirements"], selected_items,
                 plan.get("contract", _default_artifact_contract(filename)),
                 caller,
@@ -264,6 +287,7 @@ def synthesize_file_deliverables(
         outputs, ph_tokens = _repair_placeholders(outputs, blackboard, caller)
         total_tokens += ph_tokens
 
+        _finalize_synthesis_usage(usage_by_model)
         return outputs, total_tokens
     finally:
         end_call_model_usage()
@@ -341,7 +365,7 @@ def _cap_sections(
 
 
 def _sectioned_synthesis(blackboard: Blackboard, must_include: list[dict],
-                         active: list[Entry], caller: ModelCaller) -> tuple[str, int]:
+                         active: list[Entry], caller: ModelCaller) -> tuple[str, int, dict]:
     """Draft deliverable in sections to avoid output truncation on large tasks."""
     total_tokens = 0
 
@@ -381,7 +405,7 @@ def _sectioned_synthesis(blackboard: Blackboard, must_include: list[dict],
             jobs.append((len(jobs), chunk_name, prompt))
 
     if not jobs:
-        return "", total_tokens
+        return "", total_tokens, {}
 
     max_workers = min(
         len(jobs),
@@ -423,7 +447,6 @@ def _sectioned_synthesis(blackboard: Blackboard, must_include: list[dict],
                     blackboard, completed, len(jobs), chunk_name,
                 )
 
-    merge_call_usage(usage_by_model)
     section_drafts = []
     for result in results:
         if result is None:
@@ -436,7 +459,7 @@ def _sectioned_synthesis(blackboard: Blackboard, must_include: list[dict],
     # Assemble deterministically. Do not ask the model to reproduce completed
     # sections; that can drop exactly the details sectioning is meant to save.
     assembled = _clean_assembled_deliverable("\n\n".join(section_drafts))
-    return assembled, total_tokens
+    return assembled, total_tokens, usage_by_model
 
 
 def _section_prompt(
@@ -1262,7 +1285,7 @@ def _draft_file_deliverable(
     selected_items: list[dict],
     artifact_contract: dict,
     caller: ModelCaller,
-) -> tuple[str, int]:
+) -> tuple[str, int, dict]:
     if len(selected_items) > SECTION_THRESHOLD:
         return _sectioned_file_deliverable(
             blackboard, filename, file_reqs, selected_items,
@@ -1307,10 +1330,11 @@ CRITICAL INSTRUCTIONS:
 6. For redlines or markups, provide actual revised language and targeted drafting notes."""
 
     payload, tokens = call_model(caller, prompt, max_tokens=16384, json_mode=False)
+    by_model, _, _, _ = get_last_call_usage()
     text = payload.get("text", "").strip()
     if not text:
         text = str(payload)
-    return _clean_assembled_deliverable(text), tokens
+    return _clean_assembled_deliverable(text), tokens, (by_model or {})
 
 
 def _sectioned_file_deliverable(
@@ -1320,8 +1344,9 @@ def _sectioned_file_deliverable(
     selected_items: list[dict],
     artifact_contract: dict,
     caller: ModelCaller,
-) -> tuple[str, int]:
+) -> tuple[str, int, dict]:
     total_tokens = 0
+    usage_by_model: dict = {}
 
     by_section: dict[str, list[dict]] = {}
     for item in selected_items:
@@ -1395,6 +1420,8 @@ CRITICAL INSTRUCTIONS:
                 caller, prompt, max_tokens=SECTION_DRAFT_MAX_TOKENS, json_mode=False,
             )
             total_tokens += tokens
+            by_model, _, _, _ = get_last_call_usage()
+            _merge_usage(usage_by_model, by_model)
             text = payload.get("text", "").strip()
             if not text:
                 continue
@@ -1406,7 +1433,11 @@ CRITICAL INSTRUCTIONS:
                 f"completed {filename}: {chunk_name}",
             )
 
-    return _clean_assembled_deliverable("\n\n".join(section_drafts)), total_tokens
+    return (
+        _clean_assembled_deliverable("\n\n".join(section_drafts)),
+        total_tokens,
+        usage_by_model,
+    )
 
 
 def _section_heading_for_file(filename: str, section_name: str) -> str:

@@ -116,22 +116,6 @@ def set_last_call_usage(by_model: dict | None) -> None:
     _usage_state.last_out = sum(v.get("output", 0) for v in by_model.values())
 
 
-def merge_call_usage(by_model: dict | None) -> None:
-    """Merge externally collected usage into the active aggregate, if any."""
-    if not isinstance(by_model, dict):
-        return
-    aggregate = getattr(_usage_state, "usage_aggregate", None)
-    if aggregate is None:
-        return
-    for model, usage in by_model.items():
-        if model not in aggregate:
-            aggregate[model] = {"input": 0, "output": 0, "total": 0, "calls": 0}
-        aggregate[model]["input"] += usage.get("input", 0)
-        aggregate[model]["output"] += usage.get("output", 0)
-        aggregate[model]["total"] += usage.get("total", 0)
-        aggregate[model]["calls"] += usage.get("calls", 0)
-
-
 def _record_aggregate_usage(result) -> None:
     aggregate = getattr(_usage_state, "usage_aggregate", None)
     if aggregate is None:

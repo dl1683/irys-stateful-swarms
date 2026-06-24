@@ -56,7 +56,7 @@ def test_sectioned_synthesis_preserves_section_drafts_without_final_rewrite():
         "Beta section SENTINEL_BETA",
     ])
 
-    draft, tokens = _sectioned_synthesis(blackboard, must_include, active, caller)
+    draft, tokens, _ = _sectioned_synthesis(blackboard, must_include, active, caller)
 
     assert tokens == 30
     assert len(caller.prompts) == 2
@@ -72,7 +72,7 @@ def test_sectioned_synthesis_strips_redundant_model_section_headings():
         "Required Findings\n\nRequired Findings\n\nThe finding survives.",
     ])
 
-    draft, _ = _sectioned_synthesis(blackboard, must_include, [], caller)
+    draft, _, _ = _sectioned_synthesis(blackboard, must_include, [], caller)
 
     assert draft == "## Required Findings\n\nThe finding survives."
 
@@ -111,7 +111,7 @@ def test_sectioned_synthesis_chunks_large_single_section_and_scopes_evidence():
         "RISK_CHUNK_4",
     ])
 
-    draft, tokens = _sectioned_synthesis(blackboard, must_include, active, caller)
+    draft, tokens, _ = _sectioned_synthesis(blackboard, must_include, active, caller)
 
     assert tokens == 60
     assert "## Risk Part 1\n\nRISK_CHUNK_1" in draft
