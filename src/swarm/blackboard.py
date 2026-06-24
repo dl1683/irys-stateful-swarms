@@ -45,6 +45,14 @@ class Blackboard:
     token_budget: int = 3_000_000
     started_at: str = ""
     output_dir: str = ""
+    _entry_index: dict[str, Entry] = field(
+        default_factory=dict, repr=False, compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        for e in self.entries:
+            if e.id:
+                self._entry_index[e.id] = e
 
     def add_tokens_from_last_call(self, tokens: int) -> None:
         """Add tokens and grab model info from the last call_model invocation."""
@@ -81,14 +89,10 @@ class Blackboard:
         return round(self.total_tokens_used / max(self.token_budget, 1) * 100, 1)
 
     def _index_entry(self, entry: Entry) -> None:
-        if not hasattr(self, '_entry_index'):
-            self._entry_index: dict[str, Entry] = {}
         if entry.id:
             self._entry_index[entry.id] = entry
 
     def _ensure_unique_id(self, entry: Entry) -> None:
-        if not hasattr(self, '_entry_index'):
-            self._entry_index = {}
         if entry.id and entry.id in self._entry_index:
             from .models import gen_entry_id
             for _ in range(100):
@@ -114,15 +118,7 @@ class Blackboard:
             self._propagate_effects(e)
 
     def find_entry(self, entry_id: str) -> Entry | None:
-        if hasattr(self, '_entry_index'):
-            found = self._entry_index.get(entry_id)
-            if found is not None:
-                return found
-        for e in self.entries:
-            if e.id == entry_id:
-                self._index_entry(e)
-                return e
-        return None
+        return self._entry_index.get(entry_id)
 
     def get_entries_by_ids(self, ids: list[str]) -> list[Entry]:
         id_set = set(ids)
@@ -235,6 +231,7 @@ class Blackboard:
 
         for staged in staged_entries:
             self.entries.append(staged)
+            self._index_entry(staged)
 
         for sid in entry.supersedes_entries:
             target = self.find_entry(sid)

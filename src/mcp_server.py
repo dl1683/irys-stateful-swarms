@@ -192,12 +192,9 @@ def _load_state(bb_id: str) -> Any:
 
     bb = Blackboard(
         task_instruction=data.get("task_instruction", ""),
-        documents=docs, entries=[], signals=signals,
+        documents=docs, entries=entries, signals=signals,
         iteration=data.get("iteration", 0),
     )
-    for e in entries:
-        bb.entries.append(e)
-        bb._index_entry(e)
     bb._mcp_metadata = data.get("metadata", {})
     _blackboards[bb_id] = bb
 
