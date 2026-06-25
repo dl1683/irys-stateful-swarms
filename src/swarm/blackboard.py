@@ -264,3 +264,14 @@ class Blackboard:
             "token_budget": self.token_budget,
         }
         path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+
+    def run_entity_resolution(self) -> dict:
+        """
+        Run deterministic cross-document entity resolution over active entries.
+
+        Populates self.entity_registry (alias -> canonical), emits entity_alias
+        entries and entity_inconsistency signals for any cross-document name
+        variants found. Zero LLM calls.
+        """
+        from .entity_resolution import resolve_entities
+        return resolve_entities(self)
