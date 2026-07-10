@@ -369,6 +369,13 @@ def run_swarm(task: Task, caller: ModelCaller, *,
             blackboard.save_snapshot("budget_exhausted")
             break
 
+        # Entity resolution: deterministic cross-document alias detection.
+        # Zero LLM calls. Emits entity_alias entries and high-priority signals
+        # for any name variants found across documents (e.g. "Zenith Petrochem"
+        # vs "Zenith Petrochemical"). Runs every iteration so new entries from
+        # that iteration are included before the snapshot.
+        blackboard.run_entity_resolution()
+
         if iteration == 1 or iteration % 4 == 0 or iteration == max_iter:
             blackboard.save_snapshot(f"post_{iteration}")
 
