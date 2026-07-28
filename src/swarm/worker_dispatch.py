@@ -212,10 +212,141 @@ RULES:
 - If you cannot determine something, return type "gap"
 - Aim for HIGH DENSITY: 15-40 findings per worker call. Fewer than 10 means you are summarizing.
 """)
-    return "\n".join(parts)
+
+
+# ── Verb-specific prompt templates (SWARM_ENABLE_VERB_PROMPTS=1) ─────
+
+
+def _verb_prompts_enabled() -> bool:
+    return os.getenv("SWARM_ENABLE_VERB_PROMPTS", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _detect_task_verb(task_instruction: str) -> str:
+    """Detect the primary task verb from the instruction."""
+    if not task_instruction:
+        return "draft"
+    lower = task_instruction.lower().strip()
+    if re.search(
+        r"\b(identify|list|enumerate|find all|locate|determine what)"
+        r"\b", lower,
+    ):
+        return "identify"
+    if re.search(
+        r"\b(compare|contrast|distinguish|difference|"
+        r"similarit(?:y|ies)|versus)\b", lower,
+    ) or "vs." in lower:
+        return "compare"
+    if re.search(
+        r"\b(extract|pull out|gather|collect|retrieve)"
+        r"\b", lower,
+    ):
+        return "extract"
+    if re.search(
+        r"\b(analyze|assess|evaluate|review|examine)"
+        r"\b", lower,
+    ):
+        return "analyze"
+    return "draft"
+
+
+_IDENTIFY_PROMPT = """
+VERB-SPECIFIC INSTRUCTIONS — IDENTIFY TASK:
+- You MUST enumerate EVERY individual item separately. DO NOT summarize groups.
+- Output format: use a numbered list where each item is its own finding.
+- Each finding = exactly ONE item (one clause, one date, one amount, one party).
+- If the task asks for "all X", you must list each X as a separate finding.
+- Do NOT combine multiple items into one finding paragraph.
+- Missing even one item is a failure — be exhaustive.
+- Quality target: 20-40 findings. Fewer than 15 means you're summarizing.
+"""
+
+_COMPARE_PROMPT = """
+VERB-SPECIFIC INSTRUCTIONS — COMPARE TASK:
+- For each entity/concept being compared, create ONE finding per entity.
+- Structure: "[Document A] has X=$500K; [Document B] has X=$750K — difference is $250K"
+- Explicitly flag conflicts: "CONFLICT: Document A says X, Document B says Y"
+- Include source document name in EVERY finding's source_document field.
+- For numerical comparisons, show the arithmetic: "B - A = $250K"
+- Identify which document is more recent or authoritative when applicable.
+- If a value exists in only one document, note it as "only in [Doc]" not as a conflict.
+"""
+
+_EXTRACT_PROMPT = """
+VERB-SPECIFIC INSTRUCTIONS — EXTRACT TASK:
+- HIGH DENSITY REQUIRED: produce 25-50 findings per worker call.
+- Exact values only: "$2,541,500" not "about $2.5 million". Quote exact text.
+- Every dollar amount, date, defined term, and party name = separate finding.
+- Every numbered clause, schedule item, exhibit entry = separate finding.
+- Include the exact source section for each extracted value.
+- Include EVIDENCE (exact quote) for every finding — no exceptions.
+- If an amount appears with a calculation step, show the arithmetic in evidence.
+- Do NOT merge or aggregate values — preserve exact granularity.
+"""
+
+_ANALYZE_PROMPT = """
+VERB-SPECIFIC INSTRUCTIONS — ANALYZE TASK:
+- Structure analysis as: evidence → intermediate inference → conclusion.
+- Reference specific entry IDs when building on prior findings.
+- For legal analysis: identify the rule → apply facts → reach conclusion.
+- Confidence must reflect certainty: 1.0 = directly stated, 0.8 = strong inference,
+  0.6 = plausible but uncertain, 0.4 = weak signal, 0.2 = speculation.
+- Flag alternative interpretations: "Alternative view: ... because ..."
+- If data is insufficient for a conclusion, create a "gap" entry describing
+  what specific information is missing.
+- Aim for 10-20 analytical findings. Quality over quantity for analysis.
+"""
+
+_DRAFT_PROMPT = """
+VERB-SPECIFIC INSTRUCTIONS — DRAFT TASK:
+- Structure content as narrative, organized by topic/section.
+- Include all specific numbers, dates, and citations inline — no placeholders.
+- Cover every clause, schedule, and exhibit in the source documents.
+- Follow legal drafting conventions: defined terms, recitals, operative clauses.
+- If the task specifies a format (memo, letter, agreement), match it exactly.
+- Reference supporting findings by ID where relevant.
+- Quality target: cover 90%+ of criteria in a single pass.
+"""
+
+_VERB_PROMPTS: dict[str, str] = {
+    "identify": _IDENTIFY_PROMPT,
+    "compare": _COMPARE_PROMPT,
+    "extract": _EXTRACT_PROMPT,
+    "analyze": _ANALYZE_PROMPT,
+    "draft": _DRAFT_PROMPT,
+}
+
+
+def _append_verb_instructions(base_prompt: str, task_instruction: str) -> str:
+    """Append verb-specific instructions to the end of the worker prompt."""
+    if not _verb_prompts_enabled():
+        return base_prompt
+    verb = _detect_task_verb(task_instruction)
+    extra = _VERB_PROMPTS.get(verb)
+    if extra is None:
+        return base_prompt
+    return base_prompt + extra
+
+
+def compose_worker_prompt_v2(
+    task_description: str, context_entries: list[Entry],
+    document_sections: list[tuple[str, str]],
+    task_instruction: str,
+    assigned_signals: list[tuple[str, str, str]] | None = None,
+    web_search_results: str | None = None,
+) -> str:
+    """Like compose_worker_prompt but appends verb-specific instructions."""
+    from .worker_dispatch import compose_worker_prompt as _base
+    base = _base(
+        task_description, context_entries, document_sections,
+        task_instruction, assigned_signals, web_search_results,
+    )
+    return _append_verb_instructions(base, task_instruction)
 
 
 def _assigned_signal_ids(task: dict, blackboard: Blackboard) -> list[str]:
+    """Get IDs of open critical/high signals that this task should address."""
     open_signal_ids = {
         s.id for s in blackboard.signals
         if s.status == "open" and s.priority in ("critical", "high")
