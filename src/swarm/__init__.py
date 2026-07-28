@@ -308,6 +308,34 @@ def run_swarm(task: Task, caller: ModelCaller, *,
             _entries_per_iter.append(0)
             continue
 
+        # --- Analytical steering supplement (env-gated) ---
+        _steer_env = os.getenv("SWARM_ENABLE_ANALYTICAL_STEERING", "").strip().lower()
+        _steering_supplement: list[Entry] = []
+        if _steer_env in ("1", "true", "yes", "on"):
+            _steer_interval = int(os.getenv("SWARM_STEERING_INTERVAL", "3"))
+            if iteration >= _steer_interval and iteration % _steer_interval == 0:
+                from .convergence import analytical_steering
+                _steer_tasks, _steer_tokens = analytical_steering(
+                    blackboard, iter_caller,
+                )
+                blackboard.add_tokens_from_last_call(_steer_tokens)
+                if _steer_tasks:
+                    _steer_outputs = execute_workers_parallel(
+                        _steer_tasks, blackboard, iter_caller,
+                    )
+                    for wo in _steer_outputs:
+                        blackboard.add_tokens(
+                            wo.tokens_used, wo.tokens_input,
+                            wo.tokens_output, wo.model,
+                        )
+                        for e in wo.entries:
+                            if passes_quality_gate(e):
+                                _steering_supplement.append(e)
+                        for doc_name, sec_name in wo.sections_read:
+                            for ds in blackboard.documents:
+                                if ds.name == doc_name:
+                                    ds.mark_section_read(sec_name)
+
         if analysis_mode_override:
             _analytical = [
                 t for t in tasks_list
@@ -356,6 +384,9 @@ def run_swarm(task: Task, caller: ModelCaller, *,
                     if ds.name == doc_name:
                         ds.mark_section_read(sec_name)
         blackboard.add_entries_batch(new_entries)
+        if _steering_supplement:
+            blackboard.add_entries_batch(_steering_supplement)
+            new_entries.extend(_steering_supplement)
         _entries_per_iter.append(len(new_entries))
 
         new_sigs = [

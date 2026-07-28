@@ -1,0 +1,40 @@
+Hey @dl1683 📈
+
+## The Problem
+
+FAILURE_ANALYSIS.md has a brutal stat in §31:
+
+> **Strategy density is the #1 predictor of pass rate.** Tasks with ≥8% strategy entries pass at **45.8%** vs **12.4%** for tasks with <2%.
+
+There's a function called `analytical_steering()` in `convergence.py` that was specifically built to generate strategy/analysis/calculation entries. It reads the full blackboard and produces concrete analytical worker tasks.
+
+The problem? **It's dead code.** It only runs as a last-chance fallback when the orchestrator produces zero analytical workers. Which means it essentially never runs.
+
+## What this PR does
+
+Adds a proactive cadence: `SWARM_ENABLE_ANALYTICAL_STEERING=1` runs `analytical_steering()` every 3rd iteration and executes its output workers as a **supplement** to the normal orchestrator flow.
+
+```bash
+# Configure it
+export SWARM_ENABLE_ANALYTICAL_STEERING=1
+export SWARM_STEERING_INTERVAL=3  # default, configurable
+```
+
+The steering workers run in parallel, their entries get added to the blackboard alongside the regular batch, and the convergence check sees the richer analytical state.
+
+## Why this is different from the existing fallback path
+
+| Aspect | Existing fallback | This PR |
+|--------|-------------------|---------|
+| When it runs | Only if orchestrator produces 0 analytical tasks | Every N iterations proactively |
+| What happens | Replaces orchestrator tasks | Supplements them |
+| Env-gated | No | Yes (`SWARM_ENABLE_ANALYTICAL_STEERING=1`) |
+| Existing runs | Same behavior | Unchanged (env var default OFF) |
+
+## Tests
+
+20 test cases covering:
+- Env gating: disabled returns no supplement
+- Cadence: runs on iteration N, not on N-1
+- Passes existing 90-test suite
+- Integration with existing analysis_mode_override path unchanged
