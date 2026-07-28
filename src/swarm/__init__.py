@@ -13,7 +13,13 @@ from .blackboard_maintenance import (
     blackboard_maintenance_enabled,
     run_blackboard_maintenance,
 )
+from .compression import compression_enabled, compress_blackboard, compress_to_entry_ids
 from .convergence import check_convergence, supervisor_review
+from .convergence_entropy import (
+    compute_convergence as compute_entropy_convergence,
+    entropy_convergence_enabled,
+)
+from .entity_resolution import entity_resolution_enabled, run_entity_resolution
 from .seed import generate_seed, seed_to_signals
 from .domain_lens import (
     generate_domain_lens, lens_to_entries, lens_to_signals, format_lens_guidance,
@@ -276,6 +282,13 @@ def run_swarm(task: Task, caller: ModelCaller, *,
         )
         blackboard.add_tokens_from_last_call(orch_tokens)
 
+        # --- Entropy convergence metrics (every iteration, env-gated) ---
+        if entropy_convergence_enabled():
+            _entropy_metrics = compute_entropy_convergence(blackboard)
+            if _entropy_metrics.get("converged") and iteration >= min_iter:
+                blackboard.save_snapshot("entropy_converged")
+                break
+
         if orch.get("action") == "converge" and iteration >= min_iter:
             converged, conv_tokens = check_convergence(blackboard, orch, iter_caller)
             blackboard.add_tokens_from_last_call(conv_tokens)
@@ -364,6 +377,12 @@ def run_swarm(task: Task, caller: ModelCaller, *,
         ]
         if new_sigs:
             blackboard.add_tokens(prioritize_signals(blackboard, new_sigs, review_caller or caller))
+
+        # --- Entity Resolution (every 3rd iteration, env-gated) ---
+        if entity_resolution_enabled() and iteration % 3 == 0:
+            er_entries, _ = run_entity_resolution(blackboard)
+            if er_entries:
+                blackboard.add_entries_batch(er_entries)
 
         if blackboard.budget_used_pct() >= 85:
             blackboard.save_snapshot("budget_exhausted")
@@ -601,6 +620,28 @@ def run_swarm(task: Task, caller: ModelCaller, *,
 
     # Phase 8b: consolidate near-duplicate items, then build synthesis packet
     must_include = consolidate_items(must_include)
+
+    # --- Blackboard compression (env-gated, pre-synthesis) ---
+    if compression_enabled() and must_include:
+        _selected_ids = compress_to_entry_ids(blackboard, must_include)
+        if _selected_ids:
+            # Filter must_include to only the selected entries
+            _selected_set = set(_selected_ids)
+            must_include = [
+                m for m in must_include
+                if isinstance(m, dict) and m.get("entry_id", "") in _selected_set
+            ]
+            # Also trim the blackboard snapshot to keep relevant entries only
+            _keep = [
+                e for e in blackboard.entries
+                if e.status != "active" or e.id in _selected_set
+            ]
+            _pruned = len(blackboard.entries) - len(_keep)
+            if _pruned > 10:
+                _tmp = blackboard
+                _tmp.entries = _keep
+                blackboard = _tmp
+
     synthesis_packet = build_synthesis_packet(must_include, blackboard)
     write_synthesis_packet_report(synthesis_packet, blackboard.output_dir)
 
