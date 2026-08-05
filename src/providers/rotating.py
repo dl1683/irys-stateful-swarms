@@ -28,3 +28,11 @@ class RotatingCaller:
             prompt, max_tokens=max_tokens, temperature=temperature,
             json_mode=json_mode,
         )
+
+    def __repr__(self) -> str:
+        return (
+            f"RotatingCaller("
+            f"callers={len(self._callers)}, "
+            f"pattern={self._pattern}, "
+            f"idx={self._idx})"
+        )
