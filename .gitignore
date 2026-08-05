@@ -49,3 +49,6 @@ codex_*.md
 .env
 .env.local
 .env.anthropic
+
+# Node
+node_modules/
