@@ -350,6 +350,21 @@ This is what makes stateful swarms fundamentally different from stateless approa
 
 Browse any task's `swarm/blackboard_iter_*.json` files to trace the full reasoning evolution. The complete outputs for all 1,251 tasks are available in the [GitHub Releases](../../releases).
 
+### Structured entity annotations and duplicate resolution
+
+Entity maintenance keeps entity context grounded in the document record. It includes active `direct-document-worker` cards: findings produced by workers with direct document context. It excludes derived cards — including analysis, synthesis, `entity_information`, and prior resolution cards — from creating or repairing entity profiles.
+
+Configure the maintenance cycle in task metadata. The defaults are:
+
+- `entity_resolution_interval_iterations=3`: run after every third worker iteration.
+- `duplicate_review_threshold=0.85`: send sufficiently supported duplicate candidates for review.
+- `entity_profile_min_card_count=2`: require this many source cards before creating a new profile.
+- `entity_repair_max_mentions_per_card=20`: cap deterministic literal mention repair on each card.
+
+The swarm also performs a final maintenance run immediately before synthesis. `entity_information` cards provide concise, current entity context on the blackboard. Candidate evidence, as well as uncertain or rejected outcomes, remains in `swarm/entity_resolution/state.json` for auditability rather than being promoted to the blackboard.
+
+Only confirmed `same_entity` and `same_name_distinct_entity` results appear as `duplicate_name_resolution` cards. Deterministic repair improves entity-mention recall, but it cannot guarantee complete entity mentions in every document card.
+
 ## Why stateful swarms matter
 
 The AI industry has a statefulness problem. Every major AI system today — coding agents, research assistants, document analysts — treats each interaction as an isolated event. The model reasons, produces output, and forgets. The next interaction starts from zero. Context windows get compacted, destroying details that seemed unimportant but become critical later. Session boundaries erase everything.
