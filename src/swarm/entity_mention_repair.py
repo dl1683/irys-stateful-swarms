@@ -40,7 +40,7 @@ def build_entity_catalogue(
         normalized = _normalized_name(name)
         if not normalized:
             return
-        safe_type = entity_type if entity_type in ENTITY_TYPES else None
+        safe_type = _safe_entity_type(entity_type)
         canonical_profile_id = (
             profile_id if isinstance(profile_id, str) and profile_id else
             f"{safe_type or 'untyped'}:{normalized}"
@@ -67,7 +67,7 @@ def build_entity_catalogue(
             for alias in aliases:
                 add_candidate(alias, entity_type, profile_id, source_rank=0)
 
-    for entry in eligible_direct_entries(entries):
+    for entry in sorted(eligible_direct_entries(entries), key=lambda entry: entry.id):
         for index, annotation in enumerate(entry.entities):
             if not isinstance(annotation, Mapping):
                 continue
@@ -77,6 +77,8 @@ def build_entity_catalogue(
                 and isinstance(entry.entity_annotation_provenance[index], Mapping)
                 else {}
             )
+            if provenance.get("method") not in ("worker", "deterministic_repair"):
+                continue
             add_candidate(
                 annotation.get("name"),
                 annotation.get("entity_type"),
@@ -102,7 +104,7 @@ def repair_entity_mentions(
     repaired_mentions = 0
     untyped_mentions = 0
 
-    for entry in eligible_direct_entries(entries):
+    for entry in sorted(eligible_direct_entries(entries), key=lambda entry: entry.id):
         if max_mentions_per_card <= len(entry.entities):
             continue
         text = f"{entry.content}\n{entry.source.evidence if entry.source else ''}"
@@ -124,8 +126,8 @@ def repair_entity_mentions(
                 continue
 
             observed_text = _normalize_whitespace(matched.group("mention"))
-            entity_type = candidate["entity_type"]
-            if entity_type in ENTITY_TYPES:
+            entity_type = _safe_entity_type(candidate["entity_type"])
+            if entity_type is not None:
                 entry.entities.append({
                     "entity_type": entity_type,
                     "name": observed_text,
@@ -170,7 +172,7 @@ def _catalogue_candidates(
             entity_type = record.get("entity_type")
             profile_id = record.get("profile_id", key)
             records.append({
-                "entity_type": entity_type if entity_type in ENTITY_TYPES else None,
+                "entity_type": _safe_entity_type(entity_type),
                 "normalized_name": _normalized_name(normalized),
                 "profile_id": profile_id if isinstance(profile_id, str) else str(key),
             })
@@ -206,3 +208,7 @@ def _literal_match(text: str, normalized_name: str) -> re.Match[str] | None:
     tokens = normalized_name.split(" ")
     literal = r"\s+".join(re.escape(token) for token in tokens)
     return re.search(rf"(?<!\w)(?P<mention>{literal})(?!\w)", text, re.IGNORECASE)
+
+
+def _safe_entity_type(value: object) -> str | None:
+    return value if isinstance(value, str) and value in ENTITY_TYPES else None

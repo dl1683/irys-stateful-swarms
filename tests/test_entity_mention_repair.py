@@ -49,12 +49,40 @@ def test_repair_uses_literal_boundaries_not_substrings():
 def test_catalogue_includes_typed_worker_name_from_another_new_card():
     named = direct_entry("e1", "Northwind Limited signed.")
     named.entities = [{"entity_type": "company", "name": "Northwind Limited", "attributes": []}]
+    named.entity_annotation_provenance = [{"method": "worker"}]
     omitted = direct_entry("e2", "Northwind Limited amended the agreement.")
 
     catalogue = build_entity_catalogue([named, omitted], {})
     repair_entity_mentions([omitted], catalogue, 20, "run-1")
 
     assert omitted.entities == [{"entity_type": "company", "name": "Northwind Limited", "attributes": []}]
+
+
+def test_catalogue_ignores_annotation_without_worker_or_repair_provenance():
+    untrusted = direct_entry("e1", "Northwind Limited signed.")
+    untrusted.entities = [{"entity_type": "company", "name": "Northwind Limited", "attributes": []}]
+    untrusted.entity_annotation_provenance = [{"method": "duplicate_resolution"}]
+    omitted = direct_entry("e2", "Northwind Limited amended the agreement.")
+
+    catalogue = build_entity_catalogue([untrusted], {})
+    repair_entity_mentions([omitted], catalogue, 20, "run-1")
+
+    assert catalogue == {}
+    assert omitted.entities == []
+
+
+def test_repair_sorts_eligible_cards_by_id_for_deterministic_summary():
+    later = direct_entry("z-card", "Northwind Limited signed.")
+    earlier = direct_entry("a-card", "Northwind Limited amended the agreement.")
+
+    result = repair_entity_mentions(
+        [later, earlier],
+        {"company:northwind-limited": profile("company", "Northwind Limited")},
+        20,
+        "run-1",
+    )
+
+    assert result.changed_card_ids == ("a-card", "z-card")
 
 
 def test_repeat_repair_is_idempotent_and_preserves_worker_annotation():
