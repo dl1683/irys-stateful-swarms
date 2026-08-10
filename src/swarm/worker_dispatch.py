@@ -326,6 +326,10 @@ def parse_worker_output(payload: dict, iteration: int,
                 raw_doc, f.get("source_section"),
                 str(f.get("evidence", "")),
             )
+        elif direct_document_context and str(f.get("evidence", "")).strip():
+            source = EntrySource(
+                None, f.get("source_section"), str(f.get("evidence", "")),
+            )
 
         epistemic = EpistemicStatus(
             f.get("epistemic_classification", "inference"), "unknown",

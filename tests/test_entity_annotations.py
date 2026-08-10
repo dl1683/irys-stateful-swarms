@@ -41,3 +41,17 @@ def test_invalid_entity_annotation_is_audited_without_dropping_card():
     assert len(entries) == 1
     assert entries[0].entities == []
     assert entries[0].entity_annotation_rejections == ["entity_name_not_in_evidence"]
+
+
+def test_direct_document_context_validates_nonempty_evidence_without_source_document():
+    entries = parse_worker_output(
+        {"findings": [{
+            "type": "observation", "content": "Northwind signed the agreement.",
+            "evidence": "Northwind signed the agreement.",
+            "entities": [{"entity_type": "company", "name": "Invented Co", "attributes": []}],
+        }]},
+        1, "w1", "read", {"agreement.pdf"}, direct_document_context=True,
+    )
+
+    assert entries[0].entities == []
+    assert entries[0].entity_annotation_rejections == ["entity_name_not_in_evidence"]
