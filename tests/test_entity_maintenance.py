@@ -5,6 +5,7 @@ from src.swarm.blackboard import Blackboard
 from src.swarm.entity_maintenance import (
     maintenance_is_due,
     project_confirmed_decisions,
+    run_entity_maintenance,
 )
 from src.swarm.entity_maintenance_store import (
     EntityMaintenanceConfig,
@@ -15,6 +16,21 @@ from src.swarm.models import Entry, EntrySource, Task, WorkerOutput
 
 class FakeCaller:
     pass
+
+
+def direct_company_card(entry_id: str) -> Entry:
+    return Entry(
+        id=entry_id,
+        content="Northwind Limited is registered as CH-7788.",
+        source=EntrySource("registry.pdf", "Registry", "Northwind Limited CH-7788"),
+        direct_document_context=True,
+        entities=[{
+            "entity_type": "company",
+            "name": "Northwind Limited",
+            "attributes": [{"kind": "registration_number", "value": "CH-7788"}],
+        }],
+        entity_annotation_provenance=[{"method": "worker"}],
+    )
 
 
 def task_with_direct_cards(metadata: dict[str, object] | None = None) -> Task:
@@ -140,3 +156,34 @@ def test_due_gate_runs_every_three_iterations_and_always_final():
         False, False, True, False, False, True,
     ]
     assert maintenance_is_due(1, config, final=True) is True
+
+
+def test_maintenance_retires_profiles_and_projections_when_all_supporting_cards_are_superseded():
+    blackboard = Blackboard(iteration=3)
+    blackboard.add_entries_batch([direct_company_card("e1"), direct_company_card("e2")])
+    config = EntityMaintenanceConfig()
+
+    run_entity_maintenance(blackboard, FakeCaller(), config, trigger="periodic")
+    profile_id = "company:northwind-limited"
+    state = blackboard.entity_maintenance_state
+    state.candidates["candidate-stale"] = {"profile_ids": [profile_id], "status": "ignored"}
+    state.decisions["decision-stale"] = {
+        "decision_id": "decision-stale",
+        "semantic_key": "company:northwind-limited",
+        "outcome": "same_entity",
+        "evidence_fingerprint": "candidate-fingerprint-stale",
+        "profile_ids": [profile_id],
+        "source_card_ids": ["e1", "e2"],
+        "rationale": "Stale conclusion.",
+        "conflicts": [],
+    }
+    project_confirmed_decisions(blackboard, state)
+    blackboard.add_entry(Entry(id="replacement", supersedes_entries=["e1", "e2"]))
+
+    run_entity_maintenance(blackboard, FakeCaller(), config, trigger="final")
+
+    assert profile_id not in state.profiles
+    assert state.candidates == {}
+    assert state.decisions == {}
+    assert blackboard.find_entry("entity-info-company-northwind-limited").status == "superseded"
+    assert blackboard.find_entry("duplicate-resolution-company:northwind-limited").status == "superseded"

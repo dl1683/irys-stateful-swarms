@@ -6,10 +6,10 @@ from dataclasses import asdict, dataclass
 from typing import Literal
 
 from .blackboard import Blackboard
-from .entity_candidate_scoring import CandidateRefreshSummary, refresh_candidates
+from .entity_candidate_scoring import refresh_candidates
 from .entity_maintenance_store import EntityMaintenanceConfig, EntityMaintenanceState
 from .entity_mention_repair import RepairSummary, build_entity_catalogue, eligible_direct_entries, repair_entity_mentions
-from .entity_profiles import ProfileRefreshSummary, project_entity_information_cards, refresh_entity_profiles
+from .entity_profiles import project_entity_information_cards, refresh_entity_profiles
 from .entity_specialist_review import CONFIRMED_OUTCOMES, review_pending_candidates
 from .models import Entry, ModelCaller, WorkerRecord
 
@@ -49,8 +49,8 @@ def run_entity_maintenance(
     dirty_entries = [
         entry for entry in eligible_direct_entries(blackboard.entries) if state.card_is_dirty(entry)
     ]
+    all_direct_entries = eligible_direct_entries(blackboard.entries)
     if dirty_entries:
-        all_direct_entries = eligible_direct_entries(blackboard.entries)
         catalogue = build_entity_catalogue(all_direct_entries, state.profiles)
         repair = repair_entity_mentions(
             dirty_entries,
@@ -58,16 +58,16 @@ def run_entity_maintenance(
             config.entity_repair_max_mentions_per_card,
             f"entity-maintenance-{blackboard.iteration}-{trigger}",
         )
-        profiles = refresh_entity_profiles(
-            state, all_direct_entries, config.entity_profile_min_card_count,
-        )
-        project_entity_information_cards(blackboard, state, profiles)
-        candidates = refresh_candidates(state, set(profiles.dirty_profile_ids), config)
-        state.mark_cards_processed(dirty_entries)
     else:
         repair = RepairSummary()
-        profiles = ProfileRefreshSummary()
-        candidates = CandidateRefreshSummary()
+    profiles = refresh_entity_profiles(
+        state, all_direct_entries, config.entity_profile_min_card_count,
+    )
+    project_entity_information_cards(blackboard, state, profiles)
+    _retire_profile_dependencies(blackboard, state, profiles.retired_profile_ids)
+    candidates = refresh_candidates(state, set(profiles.dirty_profile_ids), config)
+    if dirty_entries:
+        state.mark_cards_processed(dirty_entries)
     review_ids = tuple(sorted(set(candidates.review_candidate_ids) | {
         candidate_id
         for candidate_id, candidate in state.candidates.items()
@@ -155,3 +155,26 @@ def _fingerprint(entry: Entry) -> str | None:
 
 def _strings(value: object) -> list[str]:
     return sorted({item for item in value if isinstance(item, str)}) if isinstance(value, list) else []
+
+
+def _retire_profile_dependencies(
+    blackboard: Blackboard,
+    state: EntityMaintenanceState,
+    retired_profile_ids: tuple[str, ...],
+) -> None:
+    retired = set(retired_profile_ids)
+    if not retired:
+        return
+    for records in (state.candidates, state.decisions):
+        for record_id, record in list(records.items()):
+            if isinstance(record, Mapping) and retired.intersection(_strings(record.get("profile_ids"))):
+                del records[record_id]
+    for entry in blackboard.entries:
+        if entry.type != "duplicate_name_resolution":
+            continue
+        try:
+            payload = json.loads(entry.content)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, Mapping) and retired.intersection(_strings(payload.get("profile_ids"))):
+            entry.status = "superseded"

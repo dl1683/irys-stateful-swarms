@@ -19,6 +19,7 @@ class ProfileRefreshSummary:
     dirty_profile_ids: tuple[str, ...] = ()
     created_profile_ids: tuple[str, ...] = ()
     updated_profile_ids: tuple[str, ...] = ()
+    retired_profile_ids: tuple[str, ...] = ()
 
 
 def refresh_entity_profiles(
@@ -51,6 +52,15 @@ def refresh_entity_profiles(
                 profile_id = repaired_profile_id
             groups[profile_id].append((entry, annotation, provenance))
 
+    supported_profile_ids = {
+        profile_id
+        for profile_id, mentions in groups.items()
+        if len({entry.id for entry, _, _ in mentions if entry.id}) >= min_card_count
+    }
+    retired = tuple(sorted(set(state.profiles) - supported_profile_ids))
+    for profile_id in retired:
+        del state.profiles[profile_id]
+
     created: list[str] = []
     updated: list[str] = []
     for profile_id in sorted(groups):
@@ -70,7 +80,7 @@ def refresh_entity_profiles(
         (created if existing is None else updated).append(profile_id)
 
     dirty = tuple(sorted((*created, *updated)))
-    return ProfileRefreshSummary(dirty, tuple(created), tuple(updated))
+    return ProfileRefreshSummary(dirty, tuple(created), tuple(updated), retired)
 
 
 def project_entity_information_cards(
@@ -80,6 +90,10 @@ def project_entity_information_cards(
 ) -> tuple[str, ...]:
     """Project each changed profile to its single concise current context card."""
     projected: list[str] = []
+    for profile_id in summary.retired_profile_ids:
+        card = blackboard.find_entry(f"entity-info-{profile_id.replace(':', '-')}")
+        if card is not None:
+            card.status = "superseded"
     for profile_id in sorted(summary.dirty_profile_ids):
         profile = state.profiles.get(profile_id)
         if not isinstance(profile, Mapping):
