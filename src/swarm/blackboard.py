@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .entity_maintenance_store import EntityMaintenanceState
 from .models import (
     DocumentStatus, Entry, Signal, WorkerRecord,
     gen_entry_id, gen_signal_id,
@@ -45,6 +46,13 @@ class Blackboard:
     token_budget: int = 3_000_000
     started_at: str = ""
     output_dir: str = ""
+    entity_maintenance_state: EntityMaintenanceState = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.entity_maintenance_state = (
+            EntityMaintenanceState.load(self.output_dir)
+            if self.output_dir else EntityMaintenanceState()
+        )
 
     def add_tokens_from_last_call(self, tokens: int) -> None:
         """Add tokens and grab model info from the last call_model invocation."""
@@ -262,5 +270,10 @@ class Blackboard:
             "iteration": self.iteration,
             "total_tokens_used": self.total_tokens_used,
             "token_budget": self.token_budget,
+            "entity_maintenance": {
+                "processed_cards": len(self.entity_maintenance_state.processed_card_fingerprints),
+                "profiles": len(self.entity_maintenance_state.profiles),
+                "decisions": len(self.entity_maintenance_state.decisions),
+            },
         }
         path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
