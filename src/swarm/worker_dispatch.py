@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from .blackboard import Blackboard
+from .entity_annotations import validate_entity_annotation_result
 from .models import (
     Entry, EntrySource, EpistemicStatus, ModelCaller, WorkerOutput, WorkerRecord,
     gen_entry_id,
@@ -17,6 +18,31 @@ from .section_index import resolve_section_text
 
 
 _usage_state = threading.local()
+
+
+ENTITY_ANNOTATION_INSTRUCTIONS = r'''
+OPTIONAL ENTITY ANNOTATIONS FOR EACH SOURCE-BACKED FINDING:
+"entities": [
+  {
+    "entity_type": "company | person",
+    "name": "name exactly as written in this card's source evidence",
+    "attributes": [
+      {
+        "kind": "source-local attribute kind",
+        "value": "value exactly supported by this card's evidence",
+        "verified": false,
+        "qualifiers": {"issuer": "required for verified government_id", "identifier_type": "required for verified government_id"}
+      }
+    ]
+  }
+]
+- Annotate every company and natural person literally named in this finding's content or evidence.
+- Do not infer unnamed entities or assemble a profile across cards.
+- Attach an attribute only when this card's evidence explicitly connects the value to that entity.
+- Use verified=true only for a government ID or birth date explicitly shown by an authoritative source; quote the exact value in evidence.
+- For a verified government ID, issuer and identifier_type are mandatory.
+- Use an empty entities array when the finding names no company or natural person.
+'''.strip()
 
 
 def parse_json_object(text: str) -> dict | None:
@@ -212,6 +238,7 @@ RULES:
 - If you cannot determine something, return type "gap"
 - Aim for HIGH DENSITY: 15-40 findings per worker call. Fewer than 10 means you are summarizing.
 """)
+    parts.append(ENTITY_ANNOTATION_INSTRUCTIONS)
     return "\n".join(parts)
 
 
@@ -268,7 +295,8 @@ def _attach_assigned_signal_ids(entries: list[Entry], signal_ids: list[str]) -> 
 
 def parse_worker_output(payload: dict, iteration: int,
                         worker_id: str, task_description: str,
-                        valid_doc_names: set[str] | None = None) -> list[Entry]:
+                        valid_doc_names: set[str] | None = None, *,
+                        direct_document_context: bool = False) -> list[Entry]:
     findings = payload.get("findings", [])
     entries = []
     for f in findings:
@@ -303,6 +331,12 @@ def parse_worker_output(payload: dict, iteration: int,
             f.get("epistemic_classification", "inference"), "unknown",
             str(f.get("epistemic_motivation", "")),
         )
+        annotation_validation = validate_entity_annotation_result(
+            f.get("entities", []), source.evidence if source else "",
+            require_literal_evidence=(
+                not direct_document_context or bool(source and source.evidence.strip())
+            ),
+        )
 
         try:
             conf = float(f.get("confidence", 0.5))
@@ -323,6 +357,10 @@ def parse_worker_output(payload: dict, iteration: int,
             contradicts_entries=_as_list(f.get("contradicts_entries", [])),
             supersedes_entries=_as_list(f.get("supersedes_entries", [])),
             addresses_signals=_as_list(f.get("addresses_signals", [])),
+            direct_document_context=direct_document_context,
+            entities=annotation_validation.annotations,
+            entity_annotation_rejections=list(annotation_validation.rejections),
+            entity_annotation_provenance=[{"method": "worker"} for _ in annotation_validation.annotations],
         ))
     return entries
 
@@ -436,6 +474,7 @@ def execute_workers_parallel(worker_tasks: list[dict], blackboard: Blackboard,
         entries = parse_worker_output(
             payload, blackboard.iteration, wid, task["description"],
             valid_doc_names=_valid_docs,
+            direct_document_context=bool(doc_sections),
         )
         _attach_assigned_signal_ids(entries, assigned_ids)
         return WorkerOutput(entries, tokens, t_in, t_out, result.model, wid, task, sections_read)

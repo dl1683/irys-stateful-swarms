@@ -56,6 +56,7 @@ from .synthesis import (
 )
 from .survival_trace import write_pending_survival_trace
 from .worker_dispatch import (
+    ENTITY_ANNOTATION_INSTRUCTIONS,
     call_model, execute_workers_parallel, parse_worker_output,
     passes_quality_gate,
 )
@@ -907,10 +908,13 @@ For each finding:
 - confidence: 0.9 for directly quoted facts, 0.7 for inferences
 - epistemic_classification: fact | adversarial_claim | expert_opinion | strategic
 
+{ENTITY_ANNOTATION_INSTRUCTIONS}
+
 Return JSON: {{"findings": [...]}}"""
         payload, tokens = call_model(caller, prompt, max_tokens=8192)
         entries = parse_worker_output(
             payload, 0, f"reader_{rt['doc_name'][:20]}", "initial_reading",
+            direct_document_context=True,
         )
         # Backfill source on entries that lack it — we KNOW the doc and section
         for e in entries:

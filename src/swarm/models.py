@@ -150,6 +150,10 @@ class Entry:
     contradicts_entries: list[str] = field(default_factory=list)
     supersedes_entries: list[str] = field(default_factory=list)
     addresses_signals: list[str] = field(default_factory=list)
+    direct_document_context: bool = False
+    entities: list[dict[str, Any]] = field(default_factory=list)
+    entity_annotation_rejections: list[str] = field(default_factory=list)
+    entity_annotation_provenance: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -167,6 +171,10 @@ class Entry:
             "supports": self.supports_entries, "contradicts": self.contradicts_entries,
             "supersedes": self.supersedes_entries,
             "addresses_signals": self.addresses_signals,
+            "direct_document_context": self.direct_document_context,
+            "entities": self.entities,
+            "entity_annotation_rejections": self.entity_annotation_rejections,
+            "entity_annotation_provenance": self.entity_annotation_provenance,
         }
 
 
