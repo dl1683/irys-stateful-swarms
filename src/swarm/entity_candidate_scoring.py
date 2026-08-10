@@ -152,6 +152,14 @@ def _person_candidates(
         evidence = (item.kind + ":" + item.relationship for item in connection.evidence)
         for profile_ids in combinations(member_ids, 2):
             add(profile_ids, connection.score, evidence, connection.conflicts)
+    resolver_profiles = _resolver_person_profiles(records, result.auto_matches)
+    for left_resolver_id, right_resolver_id in result.screened_out_profile_pairs:
+        left_members = resolver_profiles.get(left_resolver_id, ())
+        right_members = resolver_profiles.get(right_resolver_id, ())
+        for left_profile_id in left_members:
+            for right_profile_id in right_members:
+                if left_profile_id != right_profile_id:
+                    add(tuple(sorted((left_profile_id, right_profile_id))), 0.0, (), ())
 
     for profile_ids, (score, evidence, conflicts) in sorted(candidate_data.items()):
         augmented_conflicts = conflicts | set(_person_verified_conflicts(
@@ -175,6 +183,34 @@ def _intra_profile_candidates(
             str(profile["entity_type"]), (profile_id,), profiles, 0.0, (), conflicts, None,
             source_card_groups=source_card_groups,
         )
+
+
+def _resolver_person_profiles(
+    records: Iterable[PersonRecord], auto_matches: Iterable[object],
+) -> dict[str, tuple[str, ...]]:
+    parent = {record.record_id: record.record_id for record in records}
+
+    def find(record_id: str) -> str:
+        if parent[record_id] != record_id:
+            parent[record_id] = find(parent[record_id])
+        return parent[record_id]
+
+    for match in auto_matches:
+        left_root, right_root = find(match.left_record_id), find(match.right_record_id)
+        if left_root != right_root:
+            parent[max(left_root, right_root)] = min(left_root, right_root)
+    groups: dict[str, list[str]] = defaultdict(list)
+    for record_id in parent:
+        groups[find(record_id)].append(record_id)
+    return {
+        _resolver_person_profile_id(member_ids): tuple(sorted(member_ids))
+        for member_ids in groups.values()
+    }
+
+
+def _resolver_person_profile_id(member_ids: Iterable[str]) -> str:
+    canonical = json.dumps(sorted(member_ids), ensure_ascii=False, separators=(",", ":"))
+    return "person_profile_" + hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:12]
 
 
 def _candidate(

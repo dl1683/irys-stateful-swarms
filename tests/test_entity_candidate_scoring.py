@@ -35,6 +35,26 @@ def state_with_profiles(*profiles: str | dict[str, object]) -> EntityMaintenance
     return EntityMaintenanceState(profiles={str(profile["profile_id"]): profile for profile in payloads})
 
 
+def person_profile(name: str, birth_date: str) -> dict[str, object]:
+    profile_id = "person:" + "-".join(name.casefold().split())
+    return {
+        "profile_id": profile_id,
+        "entity_type": "person",
+        "primary_name": name,
+        "aliases": [],
+        "source_card_ids": [profile_id + "-card"],
+        "facts": [{
+            "field": "birth_date",
+            "value": birth_date,
+            "normalized_value": birth_date,
+            "source_card_id": profile_id + "-card",
+            "verified": True,
+        }],
+        "revision": 1,
+        "fingerprint": profile_id + "-fingerprint",
+    }
+
+
 def test_dirty_profile_is_compared_to_relevant_old_profile_but_not_unrelated_profile():
     state = state_with_profiles("Northwind Ltd", "Northwind Limited", "Bluewater PLC")
 
@@ -95,3 +115,17 @@ def test_conflicting_verified_values_within_one_profile_stay_pending_review():
     candidate = state.candidates[summary.review_candidate_ids[0]]
     assert candidate["profile_ids"] == ["company:zenith-trading"]
     assert candidate["source_card_groups"] == [["company:zenith-trading-card"], ["zenith-second-card"]]
+
+
+def test_screened_out_blocked_person_pair_with_verified_birth_conflict_is_reviewed():
+    state = state_with_profiles(
+        person_profile("Alice Smith", "1980-01-01"),
+        person_profile("Alice Jones", "1990-02-02"),
+    )
+
+    summary = refresh_candidates(state, {"person:alice-smith"}, EntityMaintenanceConfig())
+
+    candidate = state.candidates[summary.review_candidate_ids[0]]
+    assert candidate["profile_ids"] == ["person:alice-jones", "person:alice-smith"]
+    assert candidate["status"] == "pending_review"
+    assert "verified_birth_date_conflict" in candidate["conflicts"]
