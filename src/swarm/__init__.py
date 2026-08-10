@@ -24,6 +24,8 @@ from .derived_work import (
     calculation_debt_enabled,
     run_calculation_debt_detection,
 )
+from .entity_maintenance import maintenance_is_due, run_entity_maintenance
+from .entity_maintenance_store import EntityMaintenanceConfig
 from .obligations import build_synthesis_obligations
 from .models import (
     Document, DocumentStatus, Entry, EntrySource, ModelCaller, Task,
@@ -116,6 +118,7 @@ def run_swarm(task: Task, caller: ModelCaller, *,
     min_iter = min_iterations or int(os.getenv("SWARM_MIN_ITERATIONS", "2"))
     synth_caller = synthesis_caller or caller
     review_caller = reviewer_caller
+    entity_maintenance_config = EntityMaintenanceConfig.from_metadata(task.metadata)
 
     # Phase 1: Initialize
     blackboard = Blackboard(
@@ -357,6 +360,13 @@ def run_swarm(task: Task, caller: ModelCaller, *,
                     if ds.name == doc_name:
                         ds.mark_section_read(sec_name)
         blackboard.add_entries_batch(new_entries)
+        if maintenance_is_due(iteration, entity_maintenance_config):
+            run_entity_maintenance(
+                blackboard,
+                review_caller or caller,
+                entity_maintenance_config,
+                trigger="periodic",
+            )
         _entries_per_iter.append(len(new_entries))
 
         new_sigs = [
@@ -602,6 +612,12 @@ def run_swarm(task: Task, caller: ModelCaller, *,
 
     # Phase 8b: consolidate near-duplicate items, then build synthesis packet
     must_include = consolidate_items(must_include)
+    run_entity_maintenance(
+        blackboard,
+        review_caller or caller,
+        entity_maintenance_config,
+        trigger="final",
+    )
     synthesis_packet = build_synthesis_packet(must_include, blackboard)
     write_synthesis_packet_report(synthesis_packet, blackboard.output_dir)
 

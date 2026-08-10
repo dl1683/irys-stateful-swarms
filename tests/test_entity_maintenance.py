@@ -1,5 +1,6 @@
 import json
 
+from src import swarm
 from src.swarm.blackboard import Blackboard
 from src.swarm.entity_maintenance import (
     maintenance_is_due,
@@ -9,6 +10,80 @@ from src.swarm.entity_maintenance_store import (
     EntityMaintenanceConfig,
     EntityMaintenanceState,
 )
+from src.swarm.models import Entry, EntrySource, Task, WorkerOutput
+
+
+class FakeCaller:
+    pass
+
+
+def task_with_direct_cards(metadata: dict[str, object] | None = None) -> Task:
+    return Task(
+        instruction="Resolve entity records.",
+        documents=[],
+        metadata=metadata or {},
+    )
+
+
+def patch_minimal_swarm_for_iterations(monkeypatch, *, worker_iterations: int) -> None:
+    def worker_outputs(tasks, blackboard, caller):
+        entry = Entry(
+            id=f"direct-card-{blackboard.iteration}",
+            content="Northwind Ltd is named in the task record.",
+            source=EntrySource(document="task_instruction", evidence="task record"),
+            direct_document_context=True,
+        )
+        return [WorkerOutput(
+            entries=[entry], tokens_used=0, tokens_input=0, tokens_output=0,
+            model="test", worker_id="test-worker", task={}, sections_read=[],
+        )]
+
+    monkeypatch.setattr(swarm, "_execute_initial_reading", lambda *args: ([], 0))
+    monkeypatch.setattr(swarm, "run_orchestrator", lambda *args, **kwargs: (
+        {"workers": [{}]} if args[0].iteration <= worker_iterations else {"workers": []}, 0,
+    ))
+    monkeypatch.setattr(swarm, "execute_workers_parallel", worker_outputs)
+    monkeypatch.setattr(swarm, "passes_quality_gate", lambda entry: True)
+    monkeypatch.setattr(swarm, "curate_entries", lambda *args: ([], 0))
+    monkeypatch.setattr(swarm, "synthesize_deliverable", lambda *args: ("answer", 0))
+    monkeypatch.setattr(swarm, "source_claim_verification_enabled", lambda: False)
+
+
+def test_swarm_runs_maintenance_after_iteration_three_not_each_worker_batch(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        swarm,
+        "run_entity_maintenance",
+        lambda bb, caller, config, *, trigger: calls.append((bb.iteration, trigger)),
+        raising=False,
+    )
+    patch_minimal_swarm_for_iterations(monkeypatch, worker_iterations=4)
+
+    swarm.run_swarm(task_with_direct_cards(), FakeCaller(), max_iterations=4, min_iterations=4)
+
+    assert calls == [(3, "periodic"), (4, "final")]
+
+
+def test_metadata_changes_interval_without_changing_orchestrator(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        swarm,
+        "run_entity_maintenance",
+        lambda bb, caller, config, *, trigger: calls.append(
+            (bb.iteration, config.entity_resolution_interval_iterations, trigger)
+        ),
+        raising=False,
+    )
+    patch_minimal_swarm_for_iterations(monkeypatch, worker_iterations=4)
+
+    swarm.run_swarm(
+        task_with_direct_cards(metadata={"entity_resolution_interval_iterations": 2}),
+        FakeCaller(),
+        max_iterations=4,
+        min_iterations=4,
+    )
+
+    assert calls == [(2, 2, "periodic"), (4, 2, "periodic"), (4, 2, "final")]
 
 
 def _decision(outcome: str) -> dict[str, object]:
