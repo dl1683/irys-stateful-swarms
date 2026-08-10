@@ -94,6 +94,50 @@ def test_profile_fact_records_direct_worker_context_without_quote():
     assert state.profiles[summary.created_profile_ids[0]]["facts"][0]["provenance_quality"] == "direct_worker_context"
 
 
+def test_profile_preserves_verified_attribute_qualifiers_deterministically():
+    first = direct_person("e2", "Maria Chen presented her passport.", "Maria Chen passport P-123")
+    first.entities[0]["attributes"] = [{
+        "kind": "government_id",
+        "value": "P-123",
+        "verified": True,
+        "qualifiers": {"issuer": "CH", "identifier_type": "passport"},
+    }]
+    second = clone_direct(first, "e1")
+    state = EntityMaintenanceState()
+
+    created = refresh_entity_profiles(state, [first, second], min_card_count=2)
+    profile = state.profiles[created.created_profile_ids[0]]
+    facts = [fact for fact in profile["facts"] if fact["field"] == "government_id"]
+    repeated = refresh_entity_profiles(state, [second, first], min_card_count=2)
+
+    assert facts == [{
+        "field": "government_id",
+        "value": "P-123",
+        "normalized_value": "p123",
+        "source_card_id": "e1",
+        "source_document": "agreement.pdf",
+        "source_section": "Signature",
+        "quote": "Maria Chen passport P-123",
+        "provenance_quality": "quoted_direct",
+        "status": "observed",
+        "verified": True,
+        "qualifiers": {"identifier_type": "passport", "issuer": "CH"},
+    }, {
+        "field": "government_id",
+        "value": "P-123",
+        "normalized_value": "p123",
+        "source_card_id": "e2",
+        "source_document": "agreement.pdf",
+        "source_section": "Signature",
+        "quote": "Maria Chen passport P-123",
+        "provenance_quality": "quoted_direct",
+        "status": "observed",
+        "verified": True,
+        "qualifiers": {"identifier_type": "passport", "issuer": "CH"},
+    }]
+    assert repeated == ProfileRefreshSummary()
+
+
 def test_project_updates_one_current_entity_information_card_only_on_change():
     blackboard, state = blackboard_with_profile("Northwind Limited")
     first_ids = project_entity_information_cards(blackboard, state, changed("company:northwind-limited"))

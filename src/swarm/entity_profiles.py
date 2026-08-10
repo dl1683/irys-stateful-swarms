@@ -134,7 +134,11 @@ def _profile_payload(
             if not isinstance(field, str) or not field.strip() or not isinstance(value, str) or not value.strip():
                 continue
             value = value.strip()
-            _add_fact(facts, entry, field.strip(), value)
+            _add_fact(
+                facts, entry, field.strip(), value,
+                verified=attribute.get("verified") is True,
+                qualifiers=_qualifiers(attribute.get("qualifiers")),
+            )
             if field == "alias" and value != primary_name:
                 aliases.add(value)
 
@@ -153,6 +157,9 @@ def _add_fact(
     entry: Entry,
     field: str,
     value: str,
+    *,
+    verified: bool = False,
+    qualifiers: dict[str, str] | None = None,
 ) -> None:
     normalized_value = _normalized_value(value)
     key = (field, normalized_value, entry.id)
@@ -169,6 +176,8 @@ def _add_fact(
         "quote": quote,
         "provenance_quality": "quoted_direct" if value in quote else "direct_worker_context",
         "status": "observed",
+        "verified": verified,
+        "qualifiers": qualifiers or {},
     }
 
 
@@ -189,6 +198,16 @@ def _card_payload(profile: Mapping[str, object]) -> dict[str, object]:
             for field, values in sorted(facts_by_field.items())
         },
         "revision": profile.get("revision", 1),
+    }
+
+
+def _qualifiers(value: object) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        key: item
+        for key, item in sorted(value.items())
+        if isinstance(key, str) and key and isinstance(item, str) and item
     }
 
 
