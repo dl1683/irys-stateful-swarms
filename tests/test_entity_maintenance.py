@@ -102,6 +102,53 @@ def test_metadata_changes_interval_without_changing_orchestrator(monkeypatch):
     assert calls == [(2, 2, "periodic"), (4, 2, "periodic"), (4, 2, "final")]
 
 
+def test_final_duplicate_decisions_are_explicit_synthesis_items_after_curation(monkeypatch):
+    captured_packet = []
+    events = []
+    patch_minimal_swarm_for_iterations(monkeypatch, worker_iterations=4)
+
+    def maintain(blackboard, caller, config, *, trigger):
+        events.append(trigger)
+        if trigger == "final":
+            blackboard.add_entry(Entry(
+                id="duplicate-resolution-dimitri-dymitri",
+                type="duplicate_name_resolution",
+                content=(
+                    '{"outcome":"same_entity","rationale":"Dmitri K. Volkov is '
+                    'VOLKOV, Dmitriy Konstantinovich."}'
+                ),
+            ))
+            blackboard.add_entry(Entry(
+                id="duplicate-resolution-nikolai-petrov",
+                type="duplicate_name_resolution",
+                content='{"outcome":"same_entity","rationale":"Nikolai V. Petrov is confirmed."}',
+            ))
+
+    def synthesize(blackboard, packet, caller):
+        captured_packet.extend(packet)
+        return "answer", 0
+
+    def curate(blackboard, caller):
+        events.append("curate")
+        return [], 0
+
+    monkeypatch.setattr(swarm, "run_entity_maintenance", maintain)
+    monkeypatch.setattr(swarm, "curate_entries", curate)
+    monkeypatch.setattr(swarm, "synthesize_deliverable", synthesize)
+
+    swarm.run_swarm(task_with_direct_cards(), FakeCaller(), max_iterations=4, min_iterations=4)
+
+    rows = [row for row in captured_packet if row["source"] == "entity_maintenance"]
+
+    assert events.index("curate") < events.index("final")
+    assert [row["entry_ids"] for row in rows] == [
+        ["duplicate-resolution-dimitri-dymitri"],
+        ["duplicate-resolution-nikolai-petrov"],
+    ]
+    assert all(row["importance"] == "critical" for row in rows)
+    assert "VOLKOV, Dmitriy Konstantinovich" in rows[0]["summary"]
+
+
 def _decision(outcome: str) -> dict[str, object]:
     return {
         "decision_id": f"decision-{outcome}",

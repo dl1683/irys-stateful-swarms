@@ -618,6 +618,29 @@ def run_swarm(task: Task, caller: ModelCaller, *,
         entity_maintenance_config,
         trigger="final",
     )
+
+    included_entry_ids = {
+        str(entry_id).strip()
+        for item in must_include if isinstance(item, dict)
+        for raw_ids in [item.get("entry_ids", item.get("entry_id", ""))]
+        for entry_id in (
+            raw_ids if isinstance(raw_ids, list) else str(raw_ids).split(",")
+        )
+        if str(entry_id).strip()
+    }
+    for entry in sorted(blackboard.entries, key=lambda item: item.id):
+        if (
+            entry.status == "active"
+            and entry.type == "duplicate_name_resolution"
+            and entry.id not in included_entry_ids
+        ):
+            must_include.append({
+                "entry_id": entry.id,
+                "summary": entry.content,
+                "section": "Entity resolution",
+                "importance": "critical",
+                "source": "entity_maintenance",
+            })
     synthesis_packet = build_synthesis_packet(must_include, blackboard)
     write_synthesis_packet_report(synthesis_packet, blackboard.output_dir)
 
