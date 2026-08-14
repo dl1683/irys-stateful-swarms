@@ -9,7 +9,6 @@ def test_readme_documents_periodic_entity_maintenance_contract():
         "entity_profile_min_card_count",
         "entity_repair_max_mentions_per_card",
         "swarm/entity_resolution/state.json",
-        "entity_information",
         "duplicate_name_resolution",
         "direct-document-worker",
     ):

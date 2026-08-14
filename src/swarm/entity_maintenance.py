@@ -9,7 +9,7 @@ from .blackboard import Blackboard
 from .entity_candidate_scoring import refresh_candidates
 from .entity_maintenance_store import EntityMaintenanceConfig, EntityMaintenanceState
 from .entity_mention_repair import RepairSummary, build_entity_catalogue, eligible_direct_entries, repair_entity_mentions
-from .entity_profiles import project_entity_information_cards, refresh_entity_profiles
+from .entity_profiles import refresh_entity_profiles
 from .entity_specialist_review import CONFIRMED_OUTCOMES, review_pending_candidates
 from .models import Entry, ModelCaller, WorkerRecord
 
@@ -63,7 +63,6 @@ def run_entity_maintenance(
     profiles = refresh_entity_profiles(
         state, all_direct_entries, config.entity_profile_min_card_count,
     )
-    project_entity_information_cards(blackboard, state, profiles)
     _retire_profile_dependencies(blackboard, state, profiles.retired_profile_ids)
     candidates = refresh_candidates(state, set(profiles.dirty_profile_ids), config)
     if dirty_entries:

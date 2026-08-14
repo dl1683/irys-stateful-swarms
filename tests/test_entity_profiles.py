@@ -1,10 +1,6 @@
-import json
-
-from src.swarm.blackboard import Blackboard
 from src.swarm.entity_maintenance_store import EntityMaintenanceState
 from src.swarm.entity_profiles import (
     ProfileRefreshSummary,
-    project_entity_information_cards,
     refresh_entity_profiles,
 )
 from src.swarm.models import Entry, EntrySource
@@ -46,31 +42,6 @@ def clone_direct(entry: Entry, entry_id: str) -> Entry:
         entities=entry.entities,
         entity_annotation_provenance=entry.entity_annotation_provenance,
     )
-
-
-def blackboard_with_profile(name: str) -> tuple[Blackboard, EntityMaintenanceState]:
-    blackboard = Blackboard(iteration=4)
-    state = EntityMaintenanceState(profiles={
-        "company:northwind-limited": {
-            "profile_id": "company:northwind-limited",
-            "entity_type": "company",
-            "primary_name": name,
-            "aliases": [],
-            "source_card_ids": ["e1", "e2"],
-            "facts": [],
-            "revision": 1,
-            "fingerprint": "profile_fp_0123456789abcdef",
-        },
-    })
-    return blackboard, state
-
-
-def changed(profile_id: str) -> ProfileRefreshSummary:
-    return ProfileRefreshSummary(dirty_profile_ids=(profile_id,))
-
-
-def unchanged() -> ProfileRefreshSummary:
-    return ProfileRefreshSummary()
 
 
 def test_profile_requires_two_direct_cards_and_keeps_conflicting_values():
@@ -138,16 +109,6 @@ def test_profile_preserves_verified_attribute_qualifiers_deterministically():
     assert repeated == ProfileRefreshSummary()
 
 
-def test_project_updates_one_current_entity_information_card_only_on_change():
-    blackboard, state = blackboard_with_profile("Northwind Limited")
-    first_ids = project_entity_information_cards(blackboard, state, changed("company:northwind-limited"))
-    second_ids = project_entity_information_cards(blackboard, state, unchanged())
-
-    assert first_ids == ("entity-info-company-northwind-limited",)
-    assert second_ids == ()
-    assert len([entry for entry in blackboard.entries if entry.type == "entity_information"]) == 1
-
-
 def test_refresh_is_deterministic_and_only_revisions_changed_payloads():
     first = direct_company("e2", "Northwind Limited", "CH-9999")
     second = direct_company("e1", "Northwind Limited", "CH-7788")
@@ -160,33 +121,3 @@ def test_refresh_is_deterministic_and_only_revisions_changed_payloads():
     assert profile["source_card_ids"] == ["e1", "e2"]
     assert profile["revision"] == 1
     assert unchanged_summary == ProfileRefreshSummary()
-
-
-def test_projected_card_is_compact_json_and_replaces_existing_current_card():
-    blackboard, state = blackboard_with_profile("Northwind Limited")
-    state.profiles["company:northwind-limited"]["aliases"] = ["Northwind Ltd"]
-    state.profiles["company:northwind-limited"]["facts"] = [{
-        "field": "registration_number",
-        "value": "CH-7788",
-        "normalized_value": "ch7788",
-        "source_card_id": "e1",
-        "source_document": "registry.pdf",
-        "source_section": "Registry",
-        "quote": "Northwind Limited CH-7788",
-        "provenance_quality": "quoted_direct",
-        "status": "observed",
-    }]
-
-    project_entity_information_cards(blackboard, state, changed("company:northwind-limited"))
-    projected = blackboard.find_entry("entity-info-company-northwind-limited")
-
-    assert projected is not None
-    assert projected.source is None
-    assert projected.created_by.worker_id == "entity_maintenance"
-    assert json.loads(projected.content) == {
-        "aliases": ["Northwind Ltd"],
-        "facts": {"registration_number": ["CH-7788"]},
-        "primary_name": "Northwind Limited",
-        "profile_id": "company:northwind-limited",
-        "revision": 1,
-    }

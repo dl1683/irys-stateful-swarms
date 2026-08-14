@@ -158,7 +158,7 @@ def test_due_gate_runs_every_three_iterations_and_always_final():
     assert maintenance_is_due(1, config, final=True) is True
 
 
-def test_maintenance_retires_profiles_and_projections_when_all_supporting_cards_are_superseded():
+def test_maintenance_retires_profiles_candidates_and_decisions_when_support_is_superseded():
     blackboard = Blackboard(iteration=3)
     blackboard.add_entries_batch([direct_company_card("e1"), direct_company_card("e2")])
     config = EntityMaintenanceConfig()
@@ -185,5 +185,4 @@ def test_maintenance_retires_profiles_and_projections_when_all_supporting_cards_
     assert profile_id not in state.profiles
     assert state.candidates == {}
     assert state.decisions == {}
-    assert blackboard.find_entry("entity-info-company-northwind-limited").status == "superseded"
     assert blackboard.find_entry("duplicate-resolution-company:northwind-limited").status == "superseded"

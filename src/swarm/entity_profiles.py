@@ -7,11 +7,10 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
-from .blackboard import Blackboard
 from .entity_annotations import ENTITY_TYPES
 from .entity_maintenance_store import EntityMaintenanceState
 from .entity_mention_repair import eligible_direct_entries
-from .models import Entry, WorkerRecord
+from .models import Entry
 
 
 @dataclass(frozen=True)
@@ -30,8 +29,6 @@ def refresh_entity_profiles(
     """Refresh source-linked profiles from active direct-document cards only."""
     groups: dict[str, list[tuple[Entry, Mapping[str, object], Mapping[str, object]]]] = defaultdict(list)
     for entry in sorted(eligible_direct_entries(entries), key=lambda item: item.id):
-        if entry.type == "entity_information":
-            continue
         for index, annotation in enumerate(entry.entities):
             if not isinstance(annotation, Mapping):
                 continue
@@ -81,48 +78,6 @@ def refresh_entity_profiles(
 
     dirty = tuple(sorted((*created, *updated)))
     return ProfileRefreshSummary(dirty, tuple(created), tuple(updated), retired)
-
-
-def project_entity_information_cards(
-    blackboard: Blackboard,
-    state: EntityMaintenanceState,
-    summary: ProfileRefreshSummary,
-) -> tuple[str, ...]:
-    """Project each changed profile to its single concise current context card."""
-    projected: list[str] = []
-    for profile_id in summary.retired_profile_ids:
-        card = blackboard.find_entry(f"entity-info-{profile_id.replace(':', '-')}")
-        if card is not None:
-            card.status = "superseded"
-    for profile_id in sorted(summary.dirty_profile_ids):
-        profile = state.profiles.get(profile_id)
-        if not isinstance(profile, Mapping):
-            continue
-        card_id = f"entity-info-{profile_id.replace(':', '-')}"
-        content = json.dumps(_card_payload(profile), sort_keys=True, separators=(",", ":"))
-        card = blackboard.find_entry(card_id)
-        if card is None:
-            blackboard.add_entry(Entry(
-                id=card_id,
-                type="entity_information",
-                content=content,
-                created_by=WorkerRecord(
-                    "entity_maintenance", "entity_information", blackboard.iteration,
-                ),
-                confidence=1.0,
-                source=None,
-            ))
-        else:
-            card.type = "entity_information"
-            card.content = content
-            card.source = None
-            card.created_by = WorkerRecord(
-                "entity_maintenance", "entity_information", blackboard.iteration,
-            )
-            card.confidence = 1.0
-            card.status = "active"
-        projected.append(card_id)
-    return tuple(projected)
 
 
 def _profile_payload(
@@ -192,26 +147,6 @@ def _add_fact(
         "status": "observed",
         "verified": verified,
         "qualifiers": qualifiers or {},
-    }
-
-
-def _card_payload(profile: Mapping[str, object]) -> dict[str, object]:
-    facts_by_field: dict[str, list[str]] = {}
-    for fact in profile.get("facts", []):
-        if not isinstance(fact, Mapping):
-            continue
-        field, value = fact.get("field"), fact.get("value")
-        if isinstance(field, str) and isinstance(value, str):
-            facts_by_field.setdefault(field, []).append(value)
-    return {
-        "profile_id": profile.get("profile_id", ""),
-        "primary_name": profile.get("primary_name", ""),
-        "aliases": profile.get("aliases", []),
-        "facts": {
-            field: sorted(set(values), key=_name_sort_key)
-            for field, values in sorted(facts_by_field.items())
-        },
-        "revision": profile.get("revision", 1),
     }
 
 
