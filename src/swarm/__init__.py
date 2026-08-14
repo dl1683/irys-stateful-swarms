@@ -932,14 +932,13 @@ Return JSON: {{"findings": [...]}}"""
             payload, 0, f"reader_{rt['doc_name'][:20]}", "initial_reading",
             direct_document_context=True,
         )
-        # Backfill source on entries that lack it — we KNOW the doc and section
+        # Bind the known read context; only the model-supplied exact quote varies.
         for e in entries:
-            if not e.source or not e.source.document:
-                e.source = EntrySource(
-                    document=rt["doc_name"],
-                    section=rt["section_name"],
-                    evidence=e.source.evidence if e.source else "",
-                )
+            e.source = EntrySource(
+                document=rt["doc_name"],
+                section=rt["section_name"],
+                evidence=e.source.evidence if e.source else "",
+            )
         return entries, tokens, rt["doc_name"], rt["section_name"]
 
     max_w = min(len(read_tasks), 10)
