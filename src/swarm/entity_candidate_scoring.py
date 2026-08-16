@@ -56,6 +56,11 @@ def refresh_candidates(
             reused.append(matching_id)
             continue
         candidate_id = str(candidate["candidate_id"])
+        if _has_confirmed_decision_with_same_conflicts(state, candidate):
+            candidate["status"] = "reviewed"
+            state.candidates[candidate_id] = candidate
+            reused.append(candidate_id)
+            continue
         existing = state.candidates.get(candidate_id)
         if existing is None:
             new.append(candidate_id)
@@ -234,10 +239,19 @@ def _candidate(
         "verified_birth_date_conflict",
         "competing_verified_government_ids",
     })
-    status = "pending_review" if hard_conflict or (
+    linked_hard_conflict = hard_conflict and (len(profile_ids) == 1 or score > 0)
+    person_name_candidate = (
+        entity_type == "person"
+        and score >= 0.30
+        and any(item.startswith("name:") for item in evidence)
+    )
+    threshold_candidate = (
         config is not None
         and score >= config.duplicate_review_threshold
         and _independent_evidence_count(evidence) >= 2
+    )
+    status = "pending_review" if (
+        linked_hard_conflict or person_name_candidate or threshold_candidate
     ) else "ignored"
     fingerprint_payload = {
         "profile_ids": profile_ids,
@@ -431,6 +445,19 @@ def _matching_candidate_id(
         ):
             return candidate_id
     return None
+
+
+def _has_confirmed_decision_with_same_conflicts(
+    state: EntityMaintenanceState, candidate: Mapping[str, object],
+) -> bool:
+    conflicts = sorted(candidate.get("conflicts", []))
+    return any(
+        decision.get("semantic_key") == candidate["semantic_key"]
+        and decision.get("outcome") in {"same_entity", "same_name_distinct_entity"}
+        and sorted(decision.get("conflicts", [])) == conflicts
+        for decision in state.decisions.values()
+        if isinstance(decision, Mapping)
+    )
 
 
 def _verified(fact: Mapping[str, object]) -> bool:

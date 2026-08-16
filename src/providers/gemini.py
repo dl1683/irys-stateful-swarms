@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import queue
+import math
+import re
 import threading
 import time
 
@@ -9,6 +11,39 @@ from google import genai
 from google.genai import types as genai_types
 
 from ..swarm.models import ModelCaller, ModelResult
+
+
+class _RequestLimiter:
+    def __init__(self, requests_per_minute: int):
+        if requests_per_minute <= 0:
+            raise ValueError("requests_per_minute must be positive")
+        self.interval = 60 / requests_per_minute
+        self.next_request = 0.0
+        self.lock = threading.Lock()
+
+    def wait(self) -> None:
+        with self.lock:
+            now = time.monotonic()
+            start = max(now, self.next_request)
+            self.next_request = start + self.interval
+
+        delay = start - now
+        if delay > 0:
+            time.sleep(delay)
+
+
+# Shared across callers and worker threads in this process.
+# ponytail: process-global lock; use a shared store only for multi-process runs.
+_GEMINI_LIMITER = _RequestLimiter(
+    int(os.environ.get("GEMINI_REQUESTS_PER_MINUTE", "10"))
+)
+
+
+def _retry_delay(error: Exception, attempt: int) -> int:
+    match = re.search(r"retry in\s+([0-9]+(?:\.[0-9]+)?)s", str(error), re.IGNORECASE)
+    if match:
+        return max(1, math.ceil(float(match.group(1))))
+    return min(60, 5 * (2 ** attempt))
 
 
 class GeminiCaller:
@@ -73,6 +108,7 @@ class GeminiCaller:
         for attempt in range(5):
             t0 = time.perf_counter()
             try:
+                _GEMINI_LIMITER.wait()
                 response = self._generate_content_with_timeout(prompt, config)
             except TimeoutError as e:
                 last_err = e
@@ -96,7 +132,7 @@ class GeminiCaller:
                         "timeout",
                     )
                 ):
-                    wait = min(60, 5 * (2 ** attempt))
+                    wait = _retry_delay(e, attempt)
                     time.sleep(wait)
                     last_err = e
                     continue

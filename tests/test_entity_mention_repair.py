@@ -2,6 +2,8 @@ from src.swarm.entity_mention_repair import (
     build_entity_catalogue,
     repair_entity_mentions,
 )
+from src.swarm.entity_maintenance_store import EntityMaintenanceState
+from src.swarm.entity_profiles import refresh_entity_profiles
 from src.swarm.models import Entry, EntrySource
 
 
@@ -56,6 +58,20 @@ def test_catalogue_includes_typed_worker_name_from_another_new_card():
     repair_entity_mentions([omitted], catalogue, 20, "run-1")
 
     assert omitted.entities == [{"entity_type": "company", "name": "Northwind Limited", "attributes": []}]
+
+
+def test_repaired_and_worker_mentions_use_one_canonical_profile_id():
+    named = direct_entry("e1", "Northwind Limited signed.")
+    named.entities = [{"entity_type": "company", "name": "Northwind Limited", "attributes": []}]
+    named.entity_annotation_provenance = [{"method": "worker"}]
+    omitted = direct_entry("e2", "Northwind Limited amended the agreement.")
+    catalogue = build_entity_catalogue([named, omitted], {})
+
+    repair_entity_mentions([omitted], catalogue, 20, "run-1")
+    state = EntityMaintenanceState()
+    refresh_entity_profiles(state, [named, omitted], min_card_count=2)
+
+    assert list(state.profiles) == ["company:northwind-limited"]
 
 
 def test_catalogue_ignores_annotation_without_worker_or_repair_provenance():

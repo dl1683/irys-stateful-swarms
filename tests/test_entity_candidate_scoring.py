@@ -117,7 +117,7 @@ def test_conflicting_verified_values_within_one_profile_stay_pending_review():
     assert candidate["source_card_groups"] == [["company:zenith-trading-card"], ["zenith-second-card"]]
 
 
-def test_screened_out_blocked_person_pair_with_verified_birth_conflict_is_reviewed():
+def test_unrelated_person_pair_is_not_reviewed_for_birth_conflict_alone():
     state = state_with_profiles(
         person_profile("Alice Smith", "1980-01-01"),
         person_profile("Alice Jones", "1990-02-02"),
@@ -125,7 +125,59 @@ def test_screened_out_blocked_person_pair_with_verified_birth_conflict_is_review
 
     summary = refresh_candidates(state, {"person:alice-smith"}, EntityMaintenanceConfig())
 
-    candidate = state.candidates[summary.review_candidate_ids[0]]
-    assert candidate["profile_ids"] == ["person:alice-jones", "person:alice-smith"]
-    assert candidate["status"] == "pending_review"
+    assert summary.review_candidate_ids == ()
+    candidate = next(iter(state.candidates.values()))
+    assert candidate["status"] == "ignored"
     assert "verified_birth_date_conflict" in candidate["conflicts"]
+
+
+def test_person_spelling_variant_name_only_reaches_specialist_review():
+    dimitri = person_profile("Dimitri Volkov", "1980-01-01")
+    dymitri = person_profile("Dymitri Volkov", "1980-01-01")
+    dimitri["facts"] = []
+    dymitri["facts"] = []
+    state = state_with_profiles(dimitri, dymitri)
+
+    summary = refresh_candidates(state, set(state.profiles), EntityMaintenanceConfig())
+
+    candidate = state.candidates[summary.review_candidate_ids[0]]
+    assert candidate["status"] == "pending_review"
+    assert candidate["evidence"] == ["name:similar"]
+
+
+def test_reordered_abbreviated_person_name_reaches_specialist_review():
+    state = state_with_profiles(
+        person_profile("Dmitri K. Volkov", "1980-01-01"),
+        person_profile("VOLKOV, Dmitriy Konstantinovich", "1980-01-01"),
+    )
+
+    summary = refresh_candidates(state, set(state.profiles), EntityMaintenanceConfig())
+
+    assert len(summary.review_candidate_ids) == 1
+
+
+def test_confirmed_pair_is_not_reviewed_again_when_only_profile_revision_changes():
+    state = state_with_profiles(
+        person_profile("Dimitri Volkov", "1980-01-01"),
+        person_profile("Dymitri Volkov", "1980-01-01"),
+    )
+    first = refresh_candidates(state, set(state.profiles), EntityMaintenanceConfig())
+    candidate_id = first.review_candidate_ids[0]
+    candidate = state.candidates[candidate_id]
+    candidate["status"] = "reviewed"
+    state.decisions["decision-confirmed"] = {
+        "semantic_key": candidate["semantic_key"],
+        "outcome": "same_entity",
+        "conflicts": candidate["conflicts"],
+    }
+    changed_profile = state.profiles["person:dymitri-volkov"]
+    changed_profile["revision"] = 2
+    changed_profile["fingerprint"] = "updated-fingerprint"
+
+    second = refresh_candidates(
+        state, {"person:dymitri-volkov"}, EntityMaintenanceConfig(),
+    )
+
+    assert second.review_candidate_ids == ()
+    assert second.reused_candidate_ids == (candidate_id,)
+    assert state.candidates[candidate_id]["status"] == "reviewed"

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 from .entity_annotations import ENTITY_TYPES
 from .entity_maintenance_store import EntityMaintenanceState
-from .entity_mention_repair import eligible_direct_entries
+from .entity_mention_repair import eligible_direct_entries, entity_profile_id
 from .models import Entry
 
 
@@ -39,14 +39,16 @@ def refresh_entity_profiles(
             name = annotation.get("name")
             if entity_type not in ENTITY_TYPES or not isinstance(name, str) or not name.strip():
                 continue
-            profile_id = _profile_id(entity_type, name)
+            profile_id = entity_profile_id(entity_type, name)
             repaired_profile_id = provenance.get("profile_id")
             if (
                 provenance.get("method") == "deterministic_repair"
                 and isinstance(repaired_profile_id, str)
                 and repaired_profile_id.startswith(f"{entity_type}:")
             ):
-                profile_id = repaired_profile_id
+                profile_id = entity_profile_id(
+                    entity_type, repaired_profile_id.split(":", 1)[1],
+                )
             groups[profile_id].append((entry, annotation, provenance))
 
     supported_profile_ids = {
@@ -166,11 +168,6 @@ def _provenance(entry: Entry, index: int) -> Mapping[str, object]:
         if isinstance(provenance, Mapping):
             return provenance
     return {}
-
-
-def _profile_id(entity_type: str, name: str) -> str:
-    normalized_name = "-".join(re.findall(r"[\w]+", name.casefold()))
-    return f"{entity_type}:{normalized_name}"
 
 
 def _normalized_value(value: str) -> str:

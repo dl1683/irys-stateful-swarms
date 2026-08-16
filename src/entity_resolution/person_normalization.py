@@ -118,4 +118,31 @@ def person_name_similarity(left: str, right: str) -> float:
         return 0.0
     direct = SequenceMatcher(None, left_forms.normalized, right_forms.normalized).ratio()
     reordered = SequenceMatcher(None, left_forms.sorted_tokens, right_forms.sorted_tokens).ratio()
-    return max(direct, reordered)
+    aligned = _aligned_token_similarity(left_forms.tokens, right_forms.tokens)
+    return max(direct, reordered, aligned)
+
+
+def _aligned_token_similarity(left_tokens: tuple[str, ...], right_tokens: tuple[str, ...]) -> float:
+    """Match reordered tokens while treating an initial as its full-name equivalent."""
+    if not left_tokens or not right_tokens:
+        return 0.0
+    shorter, remaining = sorted(
+        (left_tokens, right_tokens), key=lambda tokens: (len(tokens), tokens),
+    )
+    remaining = list(remaining)
+    scores: list[float] = []
+    # Long tokens match first so a surname is not consumed by a one-letter initial.
+    for token in sorted(shorter, key=lambda item: (-len(item), item)):
+        options = [
+            (
+                1.0 if token == candidate else
+                0.95 if min(len(token), len(candidate)) == 1 and token[0] == candidate[0] else
+                SequenceMatcher(None, token, candidate).ratio(),
+                index,
+            )
+            for index, candidate in enumerate(remaining)
+        ]
+        score, index = max(options)
+        scores.append(score)
+        remaining.pop(index)
+    return sum(scores) / max(len(left_tokens), len(right_tokens))

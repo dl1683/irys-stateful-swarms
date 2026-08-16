@@ -15,6 +15,12 @@ class RepairSummary:
     untyped_mentions: int = 0
 
 
+def entity_profile_id(entity_type: str, name: str) -> str:
+    """Return the one profile-ID format used by workers and deterministic repair."""
+    normalized_name = "-".join(re.findall(r"[\w]+", name.casefold()))
+    return f"{entity_type}:{normalized_name}"
+
+
 def eligible_direct_entries(entries: Iterable[Entry]) -> tuple[Entry, ...]:
     return tuple(
         entry for entry in entries
@@ -41,11 +47,13 @@ def build_entity_catalogue(
         if not normalized:
             return
         safe_type = _safe_entity_type(entity_type)
-        canonical_profile_id = (
-            profile_id if isinstance(profile_id, str) and profile_id else
-            f"{safe_type or 'untyped'}:{normalized}"
-        )
-        key = f"{safe_type or 'untyped'}:{normalized}"
+        canonical_profile_id = entity_profile_id(safe_type or "untyped", name)
+        if isinstance(profile_id, str) and profile_id:
+            _, _, profile_name = profile_id.partition(":")
+            canonical_profile_id = entity_profile_id(
+                safe_type or "untyped", profile_name or name,
+            )
+        key = entity_profile_id(safe_type or "untyped", name)
         record = {
             "entity_type": safe_type,
             "normalized_name": normalized,
