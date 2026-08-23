@@ -33,7 +33,7 @@ def ingest_file(path: Path) -> Document:
     suffix = path.suffix.lower()
     name = path.name
     size_bytes = path.stat().st_size
-    doc_id = f"doc_{hashlib.md5(name.encode()).hexdigest()[:8]}"
+    doc_id = f"doc_{hashlib.md5(name.encode(), usedforsecurity=False).hexdigest()[:8]}"
 
     reader = _READERS.get(suffix, read_text)
     text, structured = reader(path)
@@ -52,7 +52,7 @@ def _make_lazy_doc(path: Path) -> Document:
     suffix = path.suffix.lower()
     name = path.name
     size_bytes = path.stat().st_size
-    doc_id = f"doc_{hashlib.md5(name.encode()).hexdigest()[:8]}"
+    doc_id = f"doc_{hashlib.md5(name.encode(), usedforsecurity=False).hexdigest()[:8]}"
     reader = _READERS.get(suffix, read_text)
 
     def _load():
