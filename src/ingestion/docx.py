@@ -10,8 +10,9 @@ def read_docx(path: Path) -> tuple[str, dict]:
     if not pandoc:
         return _read_docx_fallback(path), {}
 
+    safe_path = str(path.resolve())
     result = subprocess.run(
-        [pandoc, str(path), "-t", "markdown", "--wrap=none", "--track-changes=accept"],
+        [pandoc, "-t", "markdown", "--wrap=none", "--track-changes=accept", "--", safe_path],
         capture_output=True, text=True, timeout=30,
         encoding="utf-8", errors="replace",
     )
