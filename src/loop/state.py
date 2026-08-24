@@ -648,13 +648,17 @@ class Board:
 
     # --- Snapshots ---
 
-    def snapshot(self, label: str = "") -> None:
+   def snapshot(self, label: str = "") -> None:
         if not self.output_dir:
             return
         d = Path(self.output_dir) / "loop"
         d.mkdir(parents=True, exist_ok=True)
-        suffix = f"_{label}" if label else ""
-        path = d / f"board_iter_{self.iteration}{suffix}.json"
+        import re
+        clean_label = re.sub(r"[^\w\-]", "", label) if label else ""
+        suffix = f"_{clean_label}" if clean_label else ""
+        path = (d / f"board_iter_{self.iteration}{suffix}.json").resolve()
+        if not str(path).startswith(str(d.resolve())):
+            return
         data = {
             "instruction": self.instruction,
             "iteration": self.iteration,
