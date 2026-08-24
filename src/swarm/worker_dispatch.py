@@ -20,7 +20,7 @@ _usage_state = threading.local()
 
 
 def parse_json_object(text: str) -> dict | None:
-    """Extract the first JSON object from model output using raw_decode."""
+    """Extract the first JSON object from model output safely."""
     text = text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```\w*\n?", "", text)
@@ -30,15 +30,18 @@ def parse_json_object(text: str) -> dict | None:
         return obj if isinstance(obj, dict) else {"value": obj}
     except json.JSONDecodeError:
         pass
+
     decoder = json.JSONDecoder()
-    for i, ch in enumerate(text):
-        if ch == '{':
-            try:
-                obj, _ = decoder.raw_decode(text, i)
-                if isinstance(obj, dict):
-                    return obj
-            except json.JSONDecodeError:
-                continue
+    idx = text.find("{")
+    while idx != -1:
+        try:
+            obj, end = decoder.raw_decode(text, idx)
+            if isinstance(obj, dict):
+                return obj
+            idx = text.find("{", end)
+        except json.JSONDecodeError:
+            idx = text.find("{", idx + 1)
+
     return None
 
 
