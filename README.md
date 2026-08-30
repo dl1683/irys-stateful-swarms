@@ -2,6 +2,8 @@
 
 **The highest all-pass rate on the Legal Agent Benchmark at $4.64/task.** On all 2,010 tasks in the [Harvey Legal Agent Benchmark (LAB) v1.0](https://github.com/harveyai/harvey-labs) — 27 legal practice areas — irys-stateful-swarms achieves **32.5% strict all-pass** and **91.44% criteria macro** at **$4.64/task**, exceeding every published result including Harvey's own post-trained [Tenet model](https://www.harvey.ai/blog/post-training-update-harvey-tenet) (19.7%) and all frontier model baselines — with no fine-tuning, no custom training data, and no domain-specific scaffolding. See [benchmark comparison](#benchmark-comparison), [verification](#verification), and [benchmark context](#context).
 
+PS: We use Gemini 3.5 Flash Lite as a judge because it's intelligent, cheap, and really good with rate limits, letting us work faster. We have done evals to ensure that the model is in agreement with other judges. You're free to rescore the entire run with the judge you choose if you disagree with our judge choice
+
 ### At a glance
 
 ![Harvey LAB — All-Pass Rate](assets/lab_allpass_rate.png)
