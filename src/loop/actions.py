@@ -276,7 +276,7 @@ def _run_search(action: dict, board: Board, caller) -> dict:
         return {}
 
     src = Source(
-        id=f"web_{hashlib.md5(query.encode()).hexdigest()[:8]}",
+        id=f"web_{hashlib.md5(query.encode(), usedforsecurity=False).hexdigest()[:8]}",
         name=f"web: {query[:60]}", kind="web",
         read_status="read", relevance="definite",
         relevance_reason="fetched for query",
