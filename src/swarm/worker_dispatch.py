@@ -165,7 +165,7 @@ def compose_worker_prompt(task_description: str, context_entries: list[Entry],
                 warning = f" [CAUTION: {entry.epistemic.classification}]"
             parts.append(
                 f"  [{entry.id}] ({entry.type}, conf={entry.confidence:.1f}) "
-                f"{entry.content[:300]}{warning}"
+                f"{entry.content if entry.type == 'entity_overview' else entry.content[:300]}{warning}"
             )
 
     if assigned_signals:
@@ -269,7 +269,8 @@ def _attach_assigned_signal_ids(entries: list[Entry], signal_ids: list[str]) -> 
 def parse_worker_output(payload: dict, iteration: int,
                         worker_id: str, task_description: str,
                         valid_doc_names: set[str] | None = None) -> list[Entry]:
-    findings = payload.get("findings", [])
+    # call_model wraps a valid top-level JSON array under "value".
+    findings = payload.get("findings", payload.get("value", []))
     entries = []
     for f in findings:
         if not isinstance(f, dict):
@@ -279,7 +280,8 @@ def parse_worker_output(payload: dict, iteration: int,
             continue
         entry_type = f.get("type", "observation")
         if entry_type not in (
-            "observation", "analysis", "calculation", "strategy", "contradiction", "gap"
+            "observation", "analysis", "calculation", "strategy", "contradiction", "gap",
+            "entity_overview",
         ):
             entry_type = "observation"
 
@@ -371,6 +373,21 @@ def execute_workers_parallel(worker_tasks: list[dict], blackboard: Blackboard,
 
     def run_one(task: dict) -> WorkerOutput:
         wid = f"w{blackboard.iteration}_{uuid.uuid4().hex[:4]}"
+        if task.get("expected_output_type") == "entity_overview":
+            from .entity_overview import NameCatalogue, run_entity_overview
+            entity_id = str(task.get("entity_overview_id", ""))
+            variants = task.get("entity_variants", [])
+            catalogue = NameCatalogue({entity_id: set(variants)})
+            try:
+                entries, input_ids, tokens = run_entity_overview(
+                    catalogue, blackboard.entries, entity_id, caller, blackboard.iteration,
+                )
+            except (RuntimeError, ValueError) as exc:
+                # A failed prerequisite is recorded by the loop, not retried forever.
+                return WorkerOutput([], 0, 0, 0, "", wid, {**task, "entity_error": str(exc)}, [])
+            _, model, t_in, t_out = get_last_call_usage()
+            task = {**task, "entity_input_ids": input_ids}
+            return WorkerOutput(entries, tokens, t_in, t_out, model, wid, task, [])
         assigned_ids = _assigned_signal_ids(task, blackboard)
         assigned_signals = _assigned_signal_details(assigned_ids, blackboard)
         context_entries = blackboard.get_entries_by_ids(

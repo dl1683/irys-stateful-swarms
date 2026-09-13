@@ -16,7 +16,10 @@ _MIN_CLUSTER_DENSITY = 0.15
 
 def curate_entries(blackboard: Blackboard, caller: ModelCaller) -> tuple[list[dict], int]:
     total_tokens = 0
-    active = [e for e in blackboard.entries if e.status == "active"]
+    active = [
+        e for e in blackboard.entries
+        if e.status == "active" and e.type != "entity_overview"
+    ]
     usage_by_model: dict = {}
 
     clusters: dict[str, list[Entry]] = {}

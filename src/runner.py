@@ -129,7 +129,14 @@ def run_single_task(task_dir: Path, output_dir: Path, *,
                 reviewer_caller=reviewer_caller,
             )
     except Exception as e:
-        return RunResult(task_id=task_id, error=f"swarm error: {e}")
+        error = f"swarm error: {e}"
+        (out_dir / "status.json").write_text(json.dumps({
+            "task_id": task_id,
+            "status": "failed",
+            "error": error,
+            "wall_clock_seconds": time.time() - t0,
+        }, indent=2), encoding="utf-8")
+        return RunResult(task_id=task_id, error=error)
 
     deliverable_files = _write_deliverables(
         deliverable, deliverables_for_task, output_subdir,

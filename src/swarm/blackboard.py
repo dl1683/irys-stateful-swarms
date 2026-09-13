@@ -45,6 +45,7 @@ class Blackboard:
     token_budget: int = 3_000_000
     started_at: str = ""
     output_dir: str = ""
+    entity_overview_state: dict = field(default_factory=dict)
 
     def add_tokens_from_last_call(self, tokens: int) -> None:
         """Add tokens and grab model info from the last call_model invocation."""
@@ -262,5 +263,31 @@ class Blackboard:
             "iteration": self.iteration,
             "total_tokens_used": self.total_tokens_used,
             "token_budget": self.token_budget,
+            "entity_overview_state": self.entity_overview_state,
         }
         path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+        # Keep a stable, small summary beside snapshots so capped runs are inspectable.
+        entity_state = self.entity_overview_state
+        if entity_state:
+            variants = entity_state.get("variants", {})
+            overviews = entity_state.get("overviews", {})
+            report = {
+                "catalogue_groups": len(variants),
+                "catalogue_variants": sum(len(names) for names in variants.values()),
+                "processed_card_count": len(entity_state.get("discovered_card_ids", [])),
+                "overview_count": len(overviews),
+                "overviews": overviews,
+                "usage": entity_state.get("usage", {}),
+                "recipients": entity_state.get("recipients", []),
+                "recipient_count": len(entity_state.get("recipients", [])),
+                "referencing_recipient_count": sum(
+                    bool(item.get("referenced_overview_ids"))
+                    for item in entity_state.get("recipients", [])
+                ),
+                "failed": entity_state.get("failed", []),
+                "rejected_requests": entity_state.get("rejected_requests", []),
+                "discovery_failures": entity_state.get("discovery_failures", []),
+            }
+            (snapshot_dir / "entity_overview_report.json").write_text(
+                json.dumps(report, indent=2, default=str), encoding="utf-8",
+            )

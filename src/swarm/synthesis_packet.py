@@ -20,7 +20,7 @@ def build_synthesis_packet(
     Strategy/gap entries are marked open_issue_only=True so synthesis
     renders them as explicit open issues rather than asserting them as facts.
     """
-    by_id = {e.id: e for e in blackboard.entries}
+    by_id = {e.id: e for e in blackboard.entries if e.type != "entity_overview"}
     packet: list[dict] = []
     seen_keys: set[str] = set()
 
@@ -133,7 +133,7 @@ def filter_evidence_entries(
     by_id = {e.id: e for e in active}
     evidence_entries = [
         e for e in active
-        if e.id not in pure_open_issue_ids
+        if e.type != "entity_overview" and e.id not in pure_open_issue_ids
     ]
 
     return evidence_entries, open_issue_items

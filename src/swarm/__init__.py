@@ -59,6 +59,9 @@ from .worker_dispatch import (
     call_model, execute_workers_parallel, parse_worker_output,
     passes_quality_gate,
 )
+from .entity_overview import (
+    discover_pending_names, overview_inventory, prepare_overview_tasks,
+)
 
 
 _STRUCTURED_SINGLE_FILE_EXTENSIONS = {
@@ -69,6 +72,15 @@ _STRUCTURED_SINGLE_FILE_HINTS = (
 )
 _DOCX_FILE_SCOPED_HINTS = ("redline", "redlined", "rider")
 _DOCX_MARKUP_EXCLUSIONS = ("analysis", "memo", "report", "cover")
+
+
+def _record_entity_discovery_failure(state: dict, iteration: int, error: Exception) -> None:
+    """Leave retryable discovery failures visible in the next snapshot/report."""
+    state.setdefault("discovery_failures", []).append({
+        "iteration": iteration,
+        "error_type": type(error).__name__,
+        "error": str(error)[:300],
+    })
 
 
 def _explicit_output_filenames(deliverables_map: dict) -> list[str]:
@@ -181,6 +193,16 @@ def run_swarm(task: Task, caller: ModelCaller, *,
     entries, tokens = _execute_initial_reading(blackboard, task, caller, seed_plan, domain_lens)
     blackboard.add_entries_batch(entries)
     blackboard.add_tokens(tokens)
+    try:
+        _, name_tokens = discover_pending_names(blackboard.entity_overview_state, entries, caller)
+        blackboard.add_tokens_from_last_call(name_tokens)
+        if name_tokens:
+            usage = blackboard.entity_overview_state.setdefault("usage", {})
+            usage["name_discovery_tokens"] = usage.get("name_discovery_tokens", 0) + name_tokens
+            usage["name_discovery_calls"] = usage.get("name_discovery_calls", 0) + 1
+    except (ValueError, RuntimeError) as error:
+        # Keep unprocessed cards pending; later eligible direct work can retry discovery.
+        _record_entity_discovery_failure(blackboard.entity_overview_state, 0, error)
 
     # Phase 4: Extraction depth check — auto re-extract under-covered documents
     for doc in blackboard.documents:
@@ -272,8 +294,10 @@ def run_swarm(task: Task, caller: ModelCaller, *,
             p for p in [analysis_mode_override, _diminishing] if p
         )
 
+        inventory = overview_inventory(blackboard.entity_overview_state, blackboard.entries)
         orch, orch_tokens = run_orchestrator(
             blackboard, iter_caller, override=_combined_override,
+            entity_overviews=inventory,
         )
         blackboard.add_tokens_from_last_call(orch_tokens)
 
@@ -304,7 +328,10 @@ def run_swarm(task: Task, caller: ModelCaller, *,
                 )
                 blackboard.add_tokens_from_last_call(t3)
 
-        tasks_list = orch.get("workers", [])
+        tasks_list = prepare_overview_tasks(
+            orch.get("workers", []), inventory,
+            blackboard.entity_overview_state, iteration,
+        )
         if not tasks_list:
             _entries_per_iter.append(0)
             continue
@@ -357,6 +384,63 @@ def run_swarm(task: Task, caller: ModelCaller, *,
                     if ds.name == doc_name:
                         ds.mark_section_read(sec_name)
         blackboard.add_entries_batch(new_entries)
+        for output in outputs:
+            if output.task.get("expected_output_type") != "entity_overview":
+                continue
+            entity_id = output.task.get("entity_overview_id", "")
+            pending = blackboard.entity_overview_state.setdefault("pending", [])
+            if entity_id in pending:
+                pending.remove(entity_id)
+            overview = next((entry for entry in output.entries if entry.type == "entity_overview"), None)
+            if overview:
+                blackboard.entity_overview_state.setdefault("overviews", {})[entity_id] = {
+                    "entry_id": overview.id,
+                    "input_ids": output.task.get("entity_input_ids", []),
+                }
+                usage = blackboard.entity_overview_state.setdefault("usage", {})
+                usage["overview_tokens"] = usage.get("overview_tokens", 0) + output.tokens_used
+                usage["overview_calls"] = usage.get("overview_calls", 0) + 1
+            else:
+                blackboard.entity_overview_state.setdefault("failed", []).append(entity_id)
+
+        overview_ids = {
+            record["entry_id"]
+            for record in blackboard.entity_overview_state.get("overviews", {}).values()
+        }
+        for output in outputs:
+            consumed = [
+                entry_id for entry_id in output.task.get("reads_from_blackboard", [])
+                if entry_id in overview_ids
+            ]
+            if consumed:
+                referenced = [
+                    entry_id for entry_id in consumed
+                    if any(entry_id in entry.supports_entries for entry in output.entries)
+                ]
+                blackboard.entity_overview_state.setdefault("recipients", []).append({
+                    "iteration": iteration, "worker_id": output.worker_id,
+                    "overview_ids": consumed,
+                    "referenced_overview_ids": referenced,
+                })
+
+        direct_entries = [
+            entry for output in outputs if output.sections_read for entry in output.entries
+            if entry.type != "entity_overview"
+        ]
+        if direct_entries:
+            try:
+                _, name_tokens = discover_pending_names(
+                    blackboard.entity_overview_state, direct_entries, iter_caller,
+                )
+                blackboard.add_tokens_from_last_call(name_tokens)
+                if name_tokens:
+                    usage = blackboard.entity_overview_state.setdefault("usage", {})
+                    usage["name_discovery_tokens"] = usage.get("name_discovery_tokens", 0) + name_tokens
+                    usage["name_discovery_calls"] = usage.get("name_discovery_calls", 0) + 1
+            except (ValueError, RuntimeError) as error:
+                _record_entity_discovery_failure(
+                    blackboard.entity_overview_state, iteration, error,
+                )
         _entries_per_iter.append(len(new_entries))
 
         new_sigs = [

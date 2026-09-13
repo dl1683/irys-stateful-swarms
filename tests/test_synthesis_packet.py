@@ -128,6 +128,20 @@ def test_filter_evidence_entries():
     assert open_issues[0]["summary"] == "Gap"
 
 
+def test_entity_overviews_do_not_enter_final_evidence():
+    entries = [
+        Entry(id="e1", type="entity_overview", content="Long derived overview", confidence=0.9),
+        Entry(id="e2", type="analysis", content="Supported new analysis", confidence=0.8),
+    ]
+    bb = _bb_with_entries(entries)
+    packet = build_synthesis_packet([
+        {"entry_id": "e1", "summary": "Overview"},
+        {"entry_id": "e2", "summary": "Analysis"},
+    ], bb)
+    evidence, _ = filter_evidence_entries(packet, entries)
+    assert [entry.id for entry in evidence] == ["e2"]
+
+
 def test_artifact_contract_items_preserved():
     entries = [
         Entry(id="e1", type="observation", content="X",
