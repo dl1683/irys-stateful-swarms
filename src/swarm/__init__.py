@@ -60,7 +60,9 @@ from .worker_dispatch import (
     passes_quality_gate,
 )
 from .entity_overview import (
-    discover_pending_names, overview_inventory, prepare_overview_tasks,
+    attach_relevant_overviews, automatic_overview_tasks, defer_overview_dependent_tasks,
+    discover_pending_names, entry_state,
+    overview_inventory, prepare_overview_tasks,
 )
 
 
@@ -294,7 +296,7 @@ def run_swarm(task: Task, caller: ModelCaller, *,
             p for p in [analysis_mode_override, _diminishing] if p
         )
 
-        inventory = overview_inventory(blackboard.entity_overview_state, blackboard.entries)
+        inventory = overview_inventory(blackboard.entity_overview_state, blackboard.entries, iteration)
         orch, orch_tokens = run_orchestrator(
             blackboard, iter_caller, override=_combined_override,
             entity_overviews=inventory,
@@ -311,7 +313,7 @@ def run_swarm(task: Task, caller: ModelCaller, *,
             if analysis_mode_override:
                 _reject += " " + analysis_mode_override
             orch, t = run_orchestrator(
-                blackboard, iter_caller, override=_reject,
+                blackboard, iter_caller, override=_reject, entity_overviews=inventory,
             )
             blackboard.add_tokens_from_last_call(t)
             if orch.get("action") == "converge":
@@ -324,14 +326,22 @@ def run_swarm(task: Task, caller: ModelCaller, *,
                 if analysis_mode_override:
                     _force += " " + analysis_mode_override
                 orch, t3 = run_orchestrator(
-                    blackboard, iter_caller, override=_force,
+                    blackboard, iter_caller, override=_force, entity_overviews=inventory,
                 )
                 blackboard.add_tokens_from_last_call(t3)
 
-        tasks_list = prepare_overview_tasks(
+        automatic_tasks = automatic_overview_tasks(
+            inventory, blackboard.entity_overview_state, iteration,
+        )
+        requested_tasks = prepare_overview_tasks(
             orch.get("workers", []), inventory,
             blackboard.entity_overview_state, iteration,
         )
+        requested_tasks = defer_overview_dependent_tasks(
+            requested_tasks, inventory, blackboard.entity_overview_state, iteration,
+        )
+        tasks_list = automatic_tasks + requested_tasks
+        attach_relevant_overviews(tasks_list, blackboard.entries, blackboard.entity_overview_state)
         if not tasks_list:
             _entries_per_iter.append(0)
             continue
@@ -373,6 +383,17 @@ def run_swarm(task: Task, caller: ModelCaller, *,
 
         outputs = execute_workers_parallel(tasks_list, blackboard, iter_caller)
 
+        # A usable refresh replaces rather than silently rewrites the old overview Entry.
+        for output in outputs:
+            if not output.task.get("entity_refresh"):
+                continue
+            previous = blackboard.entity_overview_state.get("overviews", {}).get(
+                output.task.get("entity_overview_id", ""), {}
+            ).get("entry_id", "")
+            overview = next((entry for entry in output.entries if entry.type == "entity_overview"), None)
+            if previous and overview:
+                overview.supersedes_entries = [previous]
+
         new_entries = []
         for wo in outputs:
             blackboard.add_tokens(wo.tokens_used, wo.tokens_input, wo.tokens_output, wo.model)
@@ -388,20 +409,39 @@ def run_swarm(task: Task, caller: ModelCaller, *,
             if output.task.get("expected_output_type") != "entity_overview":
                 continue
             entity_id = output.task.get("entity_overview_id", "")
+            entity_ids = output.task.get("entity_overview_group_ids", [entity_id])
+            if not isinstance(entity_ids, list):
+                entity_ids = [entity_id]
             pending = blackboard.entity_overview_state.setdefault("pending", [])
-            if entity_id in pending:
-                pending.remove(entity_id)
+            for group_id in entity_ids:
+                if group_id in pending:
+                    pending.remove(group_id)
+            initial_queue = blackboard.entity_overview_state.setdefault("initial_queue", [])
+            for group_id in entity_ids:
+                if group_id in initial_queue:
+                    initial_queue.remove(group_id)
             overview = next((entry for entry in output.entries if entry.type == "entity_overview"), None)
             if overview:
-                blackboard.entity_overview_state.setdefault("overviews", {})[entity_id] = {
-                    "entry_id": overview.id,
-                    "input_ids": output.task.get("entity_input_ids", []),
-                }
+                for group_id in entity_ids:
+                    blackboard.entity_overview_state.setdefault("overviews", {})[group_id] = {
+                        "entry_id": overview.id,
+                        "input_ids": output.task.get("entity_input_ids", []),
+                        "structured": output.task.get("entity_structured_overview", {}),
+                        "source_states": {
+                            entry.id: entry_state(entry) for entry in blackboard.entries
+                            if entry.id in output.task.get("entity_input_ids", [])
+                            and entry.source and entry.source.document
+                        },
+                        "last_success_iteration": iteration,
+                    }
                 usage = blackboard.entity_overview_state.setdefault("usage", {})
                 usage["overview_tokens"] = usage.get("overview_tokens", 0) + output.tokens_used
                 usage["overview_calls"] = usage.get("overview_calls", 0) + 1
             else:
-                blackboard.entity_overview_state.setdefault("failed", []).append(entity_id)
+                failed = blackboard.entity_overview_state.setdefault("failed", [])
+                for group_id in entity_ids:
+                    if group_id not in failed:
+                        failed.append(group_id)
 
         overview_ids = {
             record["entry_id"]

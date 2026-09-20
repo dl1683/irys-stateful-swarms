@@ -285,6 +285,7 @@ class Blackboard:
                     for item in entity_state.get("recipients", [])
                 ),
                 "failed": entity_state.get("failed", []),
+                "deferred": entity_state.get("deferred", []),
                 "rejected_requests": entity_state.get("rejected_requests", []),
                 "discovery_failures": entity_state.get("discovery_failures", []),
             }

@@ -207,6 +207,8 @@ RULES:
 - Every dollar amount, date, deadline, party name, defined term = separate finding
 - Every numbered clause, schedule item, exhibit entry = separate finding
 - Reference prior findings by ID when supporting or contradicting
+- An entity overview is derived context, never a source document. Use its original
+  supports_entries IDs; set source_document to null unless you directly read a listed document.
 - Flag adversarial sources
 - Max 5 opens_questions per finding
 - If you cannot determine something, return type "gap"
@@ -379,14 +381,17 @@ def execute_workers_parallel(worker_tasks: list[dict], blackboard: Blackboard,
             variants = task.get("entity_variants", [])
             catalogue = NameCatalogue({entity_id: set(variants)})
             try:
-                entries, input_ids, tokens = run_entity_overview(
+                record = blackboard.entity_overview_state.get("overviews", {}).get(entity_id, {})
+                entries, input_ids, tokens, structured = run_entity_overview(
                     catalogue, blackboard.entries, entity_id, caller, blackboard.iteration,
+                    record.get("structured") if task.get("entity_refresh") else None,
+                    record.get("input_ids") if task.get("entity_refresh") else None,
                 )
             except (RuntimeError, ValueError) as exc:
                 # A failed prerequisite is recorded by the loop, not retried forever.
                 return WorkerOutput([], 0, 0, 0, "", wid, {**task, "entity_error": str(exc)}, [])
             _, model, t_in, t_out = get_last_call_usage()
-            task = {**task, "entity_input_ids": input_ids}
+            task = {**task, "entity_input_ids": input_ids, "entity_structured_overview": structured}
             return WorkerOutput(entries, tokens, t_in, t_out, model, wid, task, [])
         assigned_ids = _assigned_signal_ids(task, blackboard)
         assigned_signals = _assigned_signal_details(assigned_ids, blackboard)

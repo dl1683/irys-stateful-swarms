@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from hashlib import sha256
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
@@ -12,8 +13,15 @@ from .worker_dispatch import call_model, parse_worker_output
 
 
 _LEGAL_FORMS = {"ag", "gmbh", "inc", "incorporated", "ltd", "llc", "lp", "plc", "sa"}
-INITIAL_OVERVIEW_CARDS = 3
-REFRESH_OVERVIEW_CARDS = 2
+INITIAL_OVERVIEW_CARDS = 6
+REFRESH_OVERVIEW_CARDS = 4
+INITIAL_OVERVIEW_BATCH_SIZE = 3
+
+_OVERVIEW_SECTIONS = (
+    "entity_profiles",
+    "relationships_and_distinctions",
+    "unresolved_or_conflicting_evidence",
+)
 
 
 def normalize_name(name: str) -> str:
@@ -104,6 +112,12 @@ def _catalogue_from_state(state: dict) -> NameCatalogue:
     return NameCatalogue({key: set(value) for key, value in state.get("variants", {}).items()})
 
 
+def entry_state(entry: Entry) -> str:
+    """Small content/status fingerprint for refresh decisions, not a revision system."""
+    source = entry.source.document if entry.source else ""
+    return sha256(f"{entry.status}\0{source}\0{entry.content}".encode()).hexdigest()
+
+
 def record_discovered_names(state: dict, payload: dict, entries: list[Entry]) -> list[str]:
     """Apply source-backed alias links without extra calls or fuzzy group merging."""
     catalogue = _catalogue_from_state(state)
@@ -170,32 +184,142 @@ def discover_pending_names(state: dict, entries: list[Entry], caller: ModelCalle
     return added, tokens
 
 
-def overview_inventory(state: dict, entries: list[Entry]) -> list[dict]:
+def overview_inventory(state: dict, entries: list[Entry], iteration: int = 999) -> list[dict]:
     """Describe current overview availability and non-duplicated update suggestions."""
     catalogue = _catalogue_from_state(state)
     records = state.setdefault("overviews", {})
     pending = set(state.setdefault("pending", []))
     failed = set(state.setdefault("failed", []))
-    original = [entry for entry in entries if entry.status == "active" and entry.type != "entity_overview"]
+    all_original = [entry for entry in entries if entry.type != "entity_overview"]
+    original = [entry for entry in all_original if entry.status == "active"]
+    by_id = {entry.id: entry for entry in all_original}
     inventory = []
     for entity_id in sorted(catalogue.variants):
-        matched_ids = [entry.id for entry, _ in catalogue.matched_entries(original, entity_id)]
+        matched = catalogue.matched_entries(original, entity_id)
+        matched_ids = [entry.id for entry, _ in matched]
+        source_backed = [entry for entry, _ in matched if entry.source and entry.source.document]
+        source_ids = [entry.id for entry in source_backed]
+        source_documents = sorted({entry.source.document for entry in source_backed})
         record = records.get(entity_id, {})
         previous_ids = set(record.get("input_ids", []))
-        new_count = len(set(matched_ids) - previous_ids)
+        new_count = len(set(source_ids) - previous_ids)
+        previous_states = record.get("source_states", {})
+        changed_ids = [entry.id for entry in source_backed
+                       if entry.id in previous_states and previous_states[entry.id] != entry_state(entry)]
+        inactive_ids = [entry_id for entry_id in previous_ids
+                        if entry_id not in by_id or by_id[entry_id].status != "active"]
+        interval_ready = iteration - record.get("last_success_iteration", iteration - 2) >= 2
         suggestion = ""
-        if entity_id not in records and len(matched_ids) >= INITIAL_OVERVIEW_CARDS:
+        if entity_id not in records and len(source_ids) >= INITIAL_OVERVIEW_CARDS:
             suggestion = "initial"
-        elif entity_id in records and new_count >= REFRESH_OVERVIEW_CARDS:
+        elif entity_id in records and interval_ready and (new_count >= REFRESH_OVERVIEW_CARDS or changed_ids or inactive_ids):
             suggestion = "refresh"
         if entity_id in pending or entity_id in failed:
             suggestion = ""
         inventory.append({
             "entity_id": entity_id, "variants": catalogue.names_for(entity_id),
             "matched_card_ids": matched_ids, "overview_id": record.get("entry_id", ""),
-            "new_card_count": new_count, "suggestion": suggestion,
+            "source_card_ids": source_ids, "source_document_count": len(source_documents),
+            "new_card_count": new_count, "changed_source_ids": changed_ids,
+            "inactive_support_ids": inactive_ids, "suggestion": suggestion,
         })
     return inventory
+
+
+def automatic_overview_tasks(inventory: list[dict], state: dict, iteration: int) -> list[dict]:
+    """Drain initial coverage in small batches, then allow one routine update."""
+    pending = state.setdefault("pending", [])
+    queue = state.setdefault("initial_queue", [])
+    eligible_initial = [item["entity_id"] for item in inventory if item["suggestion"] == "initial"]
+    queue[:] = [entity_id for entity_id in queue if entity_id in eligible_initial]
+    for entity_id in eligible_initial:
+        if entity_id not in queue and entity_id not in pending:
+            queue.append(entity_id)
+
+    by_id = {item["entity_id"]: item for item in inventory}
+    selected = queue[:INITIAL_OVERVIEW_BATCH_SIZE]
+    if not selected:
+        # After initial coverage, avoid spending more than one automatic call per iteration.
+        selected = [item["entity_id"] for item in inventory if item["suggestion"] == "refresh"][:1]
+    tasks = []
+    covered = set()
+    for entity_id in selected:
+        item = by_id.get(entity_id)
+        if not item or entity_id in pending or entity_id in covered:
+            continue
+        # Exact shared evidence is safe to batch; partial overlap stays separate.
+        group_ids = [other_id for other_id in queue
+                     if by_id.get(other_id, {}).get("source_card_ids") == item.get("source_card_ids")]
+        group_ids = group_ids or [entity_id]
+        covered.update(group_ids)
+        for group_id in group_ids:
+            if group_id not in pending:
+                pending.append(group_id)
+        variants = sorted({name for group_id in group_ids for name in by_id[group_id]["variants"]})
+        tasks.append({
+            "description": "Create or refresh the structured entity overview from matched evidence.",
+            "expected_output_type": "entity_overview", "entity_overview_id": entity_id,
+            "entity_overview_group_ids": group_ids, "entity_variants": variants,
+            "reads_from_blackboard": [],
+            "reads_from_documents": [], "priority": "high", "automatic_overview": True,
+            "entity_refresh": item["suggestion"] == "refresh",
+            "overview_queue_iteration": iteration,
+        })
+    return tasks
+
+
+def attach_relevant_overviews(tasks: list[dict], entries: list[Entry], state: dict) -> list[dict]:
+    """Attach at most two evidence-overlapping overview entries to substantive work."""
+    active_overviews = {
+        entry.id for entry in entries
+        if entry.type == "entity_overview" and entry.status == "active"
+    }
+    records = state.get("overviews", {})
+    for task in tasks:
+        if task.get("expected_output_type") == "entity_overview":
+            continue
+        selected = set(task.get("reads_from_blackboard", []))
+        if not selected:
+            continue
+        candidates = []
+        for entity_id, record in records.items():
+            overview_id = record.get("entry_id", "")
+            overlap = selected & set(record.get("input_ids", []))
+            if overview_id in active_overviews and len(overlap) >= 2:
+                candidates.append((len(overlap), entity_id, overview_id))
+        existing = list(dict.fromkeys(task.get("reads_from_blackboard", [])))
+        attached = []
+        for overlap, entity_id, overview_id in sorted(candidates, reverse=True)[:2]:
+            if overview_id not in existing:
+                existing.append(overview_id)
+                attached.append({"overview_id": overview_id, "entity_id": entity_id, "overlap": overlap})
+        if attached:
+            task["reads_from_blackboard"] = existing
+            task["entity_overview_attachments"] = attached
+    return tasks
+
+
+def defer_overview_dependent_tasks(tasks: list[dict], inventory: list[dict], state: dict,
+                                   iteration: int) -> list[dict]:
+    """Let readers proceed, but wait when analysis needs a pending missing overview."""
+    pending = set(state.get("pending", []))
+    by_id = {item["entity_id"]: set(item["matched_card_ids"]) for item in inventory}
+    ready = []
+    for task in tasks:
+        if task.get("expected_output_type") not in {"analysis", "calculation", "strategy"}:
+            ready.append(task)
+            continue
+        selected = set(task.get("reads_from_blackboard", []))
+        blocking = next((entity_id for entity_id in pending
+                         if len(selected & by_id.get(entity_id, set())) >= 2), "")
+        if not blocking:
+            ready.append(task)
+            continue
+        state.setdefault("deferred", []).append({
+            "iteration": iteration, "entity_id": blocking,
+            "description": task.get("description", "")[:200],
+        })
+    return ready
 
 
 def prepare_overview_tasks(tasks: list[dict], inventory: list[dict], state: dict,
@@ -209,7 +333,9 @@ def prepare_overview_tasks(tasks: list[dict], inventory: list[dict], state: dict
             continue
         entity_id = task.get("entity_overview_id")
         item = inventory_by_id.get(entity_id)
-        if not item or not item["suggestion"]:
+        if entity_id in state.get("pending", []) and not task.get("automatic_overview"):
+            continue
+        if not item or (not item["suggestion"] and not item.get("matched_card_ids")):
             state.setdefault("rejected_requests", []).append({
                 "iteration": iteration,
                 "entity_id": entity_id,
@@ -217,6 +343,9 @@ def prepare_overview_tasks(tasks: list[dict], inventory: list[dict], state: dict
             })
             continue
         task["entity_variants"] = item["variants"]
+        task["entity_refresh"] = item["suggestion"] == "refresh"
+        if not item["suggestion"]:
+            task["requested_overview"] = True
         pending = state.setdefault("pending", [])
         if entity_id not in pending:
             pending.append(entity_id)
@@ -224,20 +353,34 @@ def prepare_overview_tasks(tasks: list[dict], inventory: list[dict], state: dict
     return accepted
 
 
-def build_overview_prompt(entity_id: str, names: list[str], matched: list[tuple[Entry, str]]) -> str:
+def build_overview_prompt(entity_id: str, names: list[str], matched: list[tuple[Entry, str]],
+                          previous_state: dict | None = None,
+                          previous_input_ids: list[str] | None = None) -> str:
     cards = "\n\n".join(
         f"[{entry.id}] match={reason}\nsource={entry.source.document if entry.source else 'none'}\n{entry.content}"
         for entry, reason in matched
     )
     return f"""Produce a detailed, reusable overview of the target and candidate name variants.
-Organize identity and naming, activities and roles, relationships and transactions,
-relevant dates/amounts/identifiers, contradictions, and open questions. Preserve
-specific details rather than broad summaries. Combine repetition while retaining
-supporting card references. Include potentially useful findings beyond the immediate
-question. Cards were retrieved using broad name matching: similar or identical names
-may refer to different entities, and different spellings may refer to one entity.
-Do not assume identity from retrieval. Explain supported associations, distinctions
-and uncertainty, citing original cards.
+
+These cards were retrieved broadly for relevance, not because they necessarily
+describe one entity. They may concern one entity under several names, distinct
+entities with similar names, or related entities such as shareholders,
+subsidiaries, counterparties, and screening candidates.
+
+Organize the evidence into distinct entity profiles where supported. Preserve
+uncertainty where identity cannot be established. Explicitly distinguish
+documented aliases, possible name variants, corporate relationships, and
+screening matches. A screening match is not an alias or proof of identity.
+
+Preserve original names, legal forms, jurisdictions, identifiers, and conflicting
+values. Attribute each important fact to its supporting original cards. Do not
+transfer attributes between profiles merely because names resemble each other.
+Keep relevant evidence whose entity assignment remains uncertain in an
+unresolved section.
+
+Combine repetition, retain documented no-match or cleared outcomes separately from
+transaction approval, and do not invent missing values. Keep a document claim, an
+inference, and an unresolved question distinguishable.
 
 TARGET RETRIEVAL ID: {entity_id}
 CANDIDATE SPELLINGS: {', '.join(names)}
@@ -245,28 +388,113 @@ CANDIDATE SPELLINGS: {', '.join(names)}
 MATCHED ORIGINAL CARDS (all are supplied in full):
 {cards}
 
+{("REFRESH: Previous structured state follows. Keep still-supported statements, revise changed evidence, and never treat this state as independent evidence. Newly supplied evidence IDs: " + ", ".join(entry.id for entry, _ in matched if entry.id not in set(previous_input_ids or [])) + "\n" + render_structured_overview(previous_state) if previous_state else "")}
+
 Return JSON with a \"findings\" array. Return exactly one finding with
-\"type\": \"entity_overview\" and a detailed freestyle \"content\" string containing
-the dossier; use supports_entries for its original card IDs. You may additionally
-return only \"analysis\" or \"gap\" findings for new synthesis or actionable unanswered
-questions. Each additional finding must include content and its original supporting
-card IDs in supports_entries. Do not use other finding types or rigid nested schemas.
-Do not repeat original findings."""
+\"type\": \"entity_overview\" and \"structured_overview\" containing these flexible
+arrays: \"entity_profiles\", \"relationships_and_distinctions\", and
+\"unresolved_or_conflicting_evidence\". Each array item has a \"label\" and a
+\"statements\" array. Each statement has \"text\", \"supports_entries\" (original card
+IDs), and optional \"kind\" (fact, derived, or unresolved). Empty sections are allowed.
+Use a short readable \"content\" summary too. You may additionally return only
+\"analysis\" or \"gap\" findings for new synthesis or actionable unanswered questions.
+Each additional finding must include content and its original supporting card IDs in
+supports_entries. Do not use other finding types. Do not repeat original findings."""
+
+
+def validate_structured_overview(value: object, eligible_ids: set[str]) -> tuple[dict, list[str]]:
+    """Keep valid evidence-linked statements; reject a response with none."""
+    if not isinstance(value, dict):
+        raise ValueError("entity overview response must include structured_overview")
+    structured: dict[str, list[dict]] = {}
+    referenced: list[str] = []
+    for section in _OVERVIEW_SECTIONS:
+        items = value.get(section, [])
+        if not isinstance(items, list):
+            continue
+        valid_items = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label", "")).strip()
+            statements = item.get("statements", [])
+            if not isinstance(statements, list):
+                continue
+            valid_statements = []
+            for statement in statements:
+                if not isinstance(statement, dict):
+                    continue
+                text = str(statement.get("text", "")).strip()
+                supports = statement.get("supports_entries", [])
+                if not text or not isinstance(supports, list):
+                    continue
+                supports = list(dict.fromkeys(
+                    entry_id for entry_id in supports
+                    if isinstance(entry_id, str) and entry_id in eligible_ids
+                ))
+                if not supports:
+                    continue
+                kind = str(statement.get("kind", "fact")).strip().lower()
+                if kind not in {"fact", "derived", "unresolved"}:
+                    kind = "fact"
+                valid_statements.append({"text": text, "supports_entries": supports, "kind": kind})
+                referenced.extend(supports)
+            if valid_statements:
+                valid_items.append({"label": label or section.replace("_", " "), "statements": valid_statements})
+        structured[section] = valid_items
+    if not referenced:
+        raise ValueError("entity overview response has no valid source-backed statements")
+    return structured, list(dict.fromkeys(referenced))
+
+
+def render_structured_overview(structured: dict) -> str:
+    """Render structured state directly, so workers receive every valid statement."""
+    headings = {
+        "entity_profiles": "Entity profiles",
+        "relationships_and_distinctions": "Relationships and distinctions",
+        "unresolved_or_conflicting_evidence": "Unresolved or conflicting evidence",
+    }
+    lines = []
+    for section in _OVERVIEW_SECTIONS:
+        items = structured.get(section, [])
+        if not items:
+            continue
+        lines.append(headings[section] + ":")
+        for item in items:
+            lines.append(f"- {item['label']}")
+            for statement in item["statements"]:
+                refs = ", ".join(statement["supports_entries"])
+                lines.append(f"  - [{statement['kind']}] {statement['text']} (supports: {refs})")
+    return "\n".join(lines)
 
 
 def run_entity_overview(catalogue: NameCatalogue, entries: list[Entry], entity_id: str,
-                        caller: ModelCaller, iteration: int = 0) -> tuple[list[Entry], list[str], int]:
+                        caller: ModelCaller, iteration: int = 0,
+                        previous_state: dict | None = None,
+                        previous_input_ids: list[str] | None = None) -> tuple[list[Entry], list[str], int, dict]:
     """Build one overview from all matching active original cards."""
-    matched = catalogue.matched_entries(entries, entity_id)
+    matched = [(entry, reason) for entry, reason in catalogue.matched_entries(entries, entity_id)
+               if entry.status == "active" and entry.type != "entity_overview"]
     if not matched:
-        return [], [], 0
+        return [], [], 0, {}
     payload, tokens = call_model(
         caller,
-        build_overview_prompt(entity_id, catalogue.names_for(entity_id), matched),
+        build_overview_prompt(entity_id, catalogue.names_for(entity_id), matched, previous_state, previous_input_ids),
     )
     findings = payload.get("findings", payload.get("value", []))
     if not isinstance(findings, list):
         findings = []
+    overview_finding = next((
+        finding for finding in findings
+        if isinstance(finding, dict) and finding.get("type") == "entity_overview"
+    ), None)
+    eligible_ids = {entry.id for entry, _ in matched if entry.status == "active" and entry.type != "entity_overview"}
+    structured, referenced_ids = validate_structured_overview(
+        overview_finding.get("structured_overview") if overview_finding else None, eligible_ids,
+    )
+    # Structured output is sufficient; a prose summary must not be a hidden prerequisite.
+    overview_finding["content"] = render_structured_overview(structured)
+    overview_finding["supports_entries"] = referenced_ids
     allowed = [
         finding for finding in findings
         if isinstance(finding, dict)
@@ -278,4 +506,4 @@ def run_entity_overview(catalogue: NameCatalogue, entries: list[Entry], entity_i
     overviews = [entry for entry in output if entry.type == "entity_overview"]
     if len(overviews) != 1:
         raise ValueError("entity overview response must contain exactly one entity_overview finding")
-    return output, [entry.id for entry, _ in matched], tokens
+    return output, [entry.id for entry, _ in matched], tokens, structured

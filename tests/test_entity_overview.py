@@ -2,7 +2,8 @@ import json
 
 from src.swarm.blackboard import Blackboard
 from src.swarm.entity_overview import (
-    NameCatalogue, overview_inventory, parse_discovered_names, prepare_overview_tasks,
+    NameCatalogue, attach_relevant_overviews, automatic_overview_tasks, overview_inventory,
+    defer_overview_dependent_tasks, entry_state, parse_discovered_names, prepare_overview_tasks,
     run_entity_overview,
     discover_pending_names,
 )
@@ -19,6 +20,14 @@ class FakeCaller:
     def complete(self, prompt, *, max_tokens=8192, temperature=0.05, json_mode=True):
         self.prompts.append(prompt)
         return ModelResult(next(self.responses), 10, 5, 15, "fake", 1)
+
+
+def structured(*statements):
+    """Compact valid overview payloads for the local integration checks."""
+    return {"entity_profiles": [{"label": "Candidate profile", "statements": [
+        {"text": text, "supports_entries": refs, "kind": kind}
+        for text, refs, kind in statements
+    ]}], "relationships_and_distinctions": [], "unresolved_or_conflicting_evidence": []}
 
 
 def test_discovery_links_explicit_alias_once_and_preserves_existing_overview():
@@ -75,19 +84,26 @@ def test_entity_overview_slice_preserves_candidate_matches_and_full_context():
     overview = "Müller AG is a company. " + "detail " * 80 + "[e1] supports the payment."
     caller = FakeCaller([
         json.dumps({"findings": [
-            {"type": "entity_overview", "content": overview, "confidence": 0.8, "supports_entries": ["e1", "e2"]},
+            {"type": "entity_overview", "content": overview, "confidence": 0.8,
+             "structured_overview": structured(
+                 ("Müller AG paid CHF 2m on 12 June 2025.", ["e1"], "fact"),
+                 ("Muller the signer may be unrelated to Müller AG.", ["e2"], "unresolved"),
+                 ("Muler AG may be a separate typo candidate.", ["e3"], "derived"),
+             )},
             {"type": "gap", "content": "Determine whether the individual signer is related to the company.", "confidence": 0.7, "supports_entries": ["e2"]},
         ]}),
         json.dumps({"findings": [{"type": "analysis", "content": "The supplied dossier identifies a payment and an identity ambiguity.", "confidence": 0.8}]}),
     ])
 
-    output, matched_ids, _ = run_entity_overview(catalogue, cards, entity_id, caller)
+    output, matched_ids, _, state = run_entity_overview(catalogue, cards, entity_id, caller)
     assert matched_ids == ["e1", "e2", "e3"]
     assert output[0].type == "entity_overview"
     assert output[1].type == "gap" and output[1].supports_entries == ["e2"]
     assert "[e1] match=" in caller.prompts[0] and "[e2] match=" in caller.prompts[0]
     assert "close spelling candidate: muler" in caller.prompts[0]
     assert "e4" not in caller.prompts[0]
+    assert output[0].supports_entries == ["e1", "e2", "e3"]
+    assert state["entity_profiles"][0]["statements"][2]["kind"] == "derived"
 
     board = Blackboard(task_instruction="Assess the matter", entries=output)
     downstream = execute_workers_parallel([{
@@ -95,7 +111,8 @@ def test_entity_overview_slice_preserves_candidate_matches_and_full_context():
         "reads_from_documents": [], "expected_output_type": "analysis", "priority": "high",
     }], board, caller)
     assert len(downstream[0].entries) == 1
-    assert overview in caller.prompts[1] and len(overview) > 300
+    assert "Müller AG paid CHF 2m" in caller.prompts[1]
+    assert "supports: e1" in caller.prompts[1]
 
 
 def test_name_parser_accepts_a_json_array_response():
@@ -106,10 +123,11 @@ def test_entity_overview_drops_unsupported_follow_up_types():
     catalogue = NameCatalogue()
     [entity_id] = catalogue.add(["Crestmoor Trading AG"])
     caller = FakeCaller([json.dumps({"findings": [
-        {"type": "entity_overview", "content": "A detailed overview with original-card support.", "supports_entries": ["e1"]},
+        {"type": "entity_overview", "content": "A detailed overview with original-card support.",
+         "structured_overview": structured(("Crestmoor Trading AG is the applicant.", ["e1"], "fact"))},
         {"type": "actionable_question", "content": "This must not become an observation."},
     ]})])
-    output, _, _ = run_entity_overview(
+    output, _, _, _ = run_entity_overview(
         catalogue, [Entry(id="e1", content="Crestmoor Trading AG is the applicant.")],
         entity_id, caller,
     )
@@ -120,9 +138,10 @@ def test_entity_overview_accepts_a_top_level_findings_array():
     catalogue = NameCatalogue()
     [entity_id] = catalogue.add(["Crestmoor Trading AG"])
     caller = FakeCaller([json.dumps([{
-        "type": "entity_overview", "content": "A detailed overview returned as an array.",
+        "type": "entity_overview",
+        "structured_overview": structured(("Crestmoor Trading AG is named in the card.", ["e1"], "fact")),
     }])])
-    output, _, _ = run_entity_overview(
+    output, _, _, _ = run_entity_overview(
         catalogue, [Entry(id="e1", content="Crestmoor Trading AG is the applicant.")],
         entity_id, caller,
     )
@@ -139,22 +158,104 @@ def test_generic_worker_parser_accepts_a_top_level_findings_array():
 def test_overview_inventory_suggests_initial_then_refresh_without_duplicates():
     state = {"variants": {"crestmoor trading": ["Crestmoor Trading AG"]}}
     entries = [
-        Entry(id=f"e{i}", content=f"Crestmoor Trading AG fact {i}.")
-        for i in range(1, 4)
+        Entry(id=f"e{i}", content=f"Crestmoor Trading AG fact {i}.", source=EntrySource(f"d{i}", "s"))
+        for i in range(1, 7)
     ]
     [initial] = overview_inventory(state, entries)
     assert initial["suggestion"] == "initial"
 
-    state["overviews"] = {"crestmoor trading": {"entry_id": "e4", "input_ids": ["e1", "e2", "e3"]}}
+    state["overviews"] = {"crestmoor trading": {"entry_id": "e7", "input_ids": [f"e{i}" for i in range(1, 7)]}}
     entries.extend([
-        Entry(id="e5", content="Crestmoor Trading AG update one."),
-        Entry(id="e6", content="Crestmoor Trading AG update two."),
+        Entry(id=f"e{i}", content=f"Crestmoor Trading AG update {i}.", source=EntrySource(f"d{i}", "s"))
+        for i in range(8, 12)
     ])
     [refresh] = overview_inventory(state, entries)
     assert refresh["suggestion"] == "refresh"
 
     state["pending"] = ["crestmoor trading"]
     assert overview_inventory(state, entries)[0]["suggestion"] == ""
+
+
+def test_automatic_coverage_drains_all_qualifying_groups_in_bounded_batches():
+    state = {"variants": {f"entity {i}": [f"Entity {i}"] for i in range(50)}}
+    entries = [
+        Entry(id=f"e{entity}_{card}", content=f"Entity {entity} source fact {card}.",
+              source=EntrySource(f"d{entity}_{card}", "s"))
+        for entity in range(50) for card in range(6)
+    ]
+    inventory = overview_inventory(state, entries)
+    served = []
+    while True:
+        tasks = automatic_overview_tasks(inventory, state, iteration=1)
+        if not tasks:
+            break
+        assert len(tasks) <= 3
+        for task in tasks:
+            entity_id = task["entity_overview_id"]
+            for group_id in task["entity_overview_group_ids"]:
+                served.append(group_id)
+                state["pending"].remove(group_id)
+                state["initial_queue"].remove(group_id)
+                item = next(item for item in inventory if item["entity_id"] == group_id)
+                state.setdefault("overviews", {})[group_id] = {
+                    "entry_id": f"overview-{entity_id}", "input_ids": item["source_card_ids"],
+                }
+        inventory = overview_inventory(state, entries)
+    assert len(served) == 50
+    assert len(set(served)) == 50
+
+
+def test_automatic_and_requested_overviews_deduplicate_and_attach_relevant_context():
+    state = {
+        "variants": {"crestmoor": ["Crestmoor Trading AG"]},
+    }
+    entries = [
+        Entry(id=f"e{i}", content=f"Crestmoor Trading AG fact {i}.", source=EntrySource(f"d{i}", "s"))
+        for i in range(1, 7)
+    ] + [Entry(id="overview", type="entity_overview", content="Structured context")]
+    inventory = overview_inventory(state, entries)
+    automatic = automatic_overview_tasks(inventory, state, iteration=2)
+    requested = prepare_overview_tasks([{
+        "expected_output_type": "entity_overview", "entity_overview_id": "crestmoor",
+    }], inventory, state, iteration=2)
+    assert len(automatic) == 1
+    assert requested == []
+
+    state["overviews"] = {"crestmoor": {"entry_id": "overview", "input_ids": ["e1", "e2", "e3"]}}
+    tasks = attach_relevant_overviews([{
+        "expected_output_type": "analysis", "reads_from_blackboard": ["e1", "e2"],
+    }], entries, state)
+    assert tasks[0]["reads_from_blackboard"] == ["e1", "e2", "overview"]
+    assert tasks[0]["entity_overview_attachments"][0]["overlap"] == 2
+
+
+def test_pending_overview_defers_only_dependent_substantive_work():
+    state = {"pending": ["crestmoor"]}
+    inventory = [{"entity_id": "crestmoor", "matched_card_ids": ["e1", "e2"]}]
+    tasks = defer_overview_dependent_tasks([
+        {"expected_output_type": "analysis", "reads_from_blackboard": ["e1", "e2"], "description": "Compare entities."},
+        {"expected_output_type": "observation", "reads_from_blackboard": ["e1", "e2"], "description": "Read facts."},
+        {"expected_output_type": "analysis", "reads_from_blackboard": ["e1"], "description": "Unrelated analysis."},
+    ], inventory, state, iteration=3)
+    assert [task["description"] for task in tasks] == ["Read facts.", "Unrelated analysis."]
+    assert state["deferred"][0]["entity_id"] == "crestmoor"
+
+
+def test_exactly_overlapping_groups_share_a_job_without_merging_variants():
+    state = {"variants": {
+        "crestmoor": ["Crestmoor Trading AG"],
+        "crestmoor candidate": ["Crestmoor Trade & Supply GmbH"],
+    }}
+    entries = [
+        Entry(id=f"e{i}", content="Crestmoor Trading AG and Crestmoor Trade & Supply GmbH screening context.",
+              source=EntrySource(f"d{i}", "s"))
+        for i in range(6)
+    ]
+    inventory = overview_inventory(state, entries)
+    tasks = automatic_overview_tasks(inventory, state, iteration=1)
+    assert len(tasks) == 1
+    assert tasks[0]["entity_overview_group_ids"] == ["crestmoor", "crestmoor candidate"]
+    assert tasks[0]["entity_variants"] == ["Crestmoor Trade & Supply GmbH", "Crestmoor Trading AG"]
 
 
 def test_overview_tasks_reject_missing_or_unscheduled_entity_ids():
@@ -180,6 +281,19 @@ def test_overview_tasks_reject_missing_or_unscheduled_entity_ids():
     }]
 
 
+def test_orchestrator_can_request_a_supported_low_frequency_overview():
+    state = {}
+    inventory = [{
+        "entity_id": "crestmoor trading", "variants": ["Crestmoor Trading AG"],
+        "matched_card_ids": ["e1"], "suggestion": "",
+    }]
+    accepted = prepare_overview_tasks([{
+        "expected_output_type": "entity_overview", "entity_overview_id": "crestmoor trading",
+    }], inventory, state, iteration=1)
+    assert accepted[0]["requested_overview"] is True
+    assert state["pending"] == ["crestmoor trading"]
+
+
 def test_orchestrated_overview_reaches_a_downstream_worker_without_live_calls():
     board = Blackboard(task_instruction="Assess sanctions exposure", entries=[
         Entry(id=f"e{i}", content=f"Crestmoor Trading AG fact {i}.")
@@ -201,7 +315,7 @@ def test_orchestrated_overview_reaches_a_downstream_worker_without_live_calls():
         }]}),
         json.dumps({"findings": [{
             "type": "entity_overview", "content": overview_text,
-            "supports_entries": ["e1", "e2", "e3"],
+            "structured_overview": structured(("Crestmoor Trading AG is the buyer in each supplied card.", ["e1", "e2", "e3"], "fact")),
         }]}),
         json.dumps({"findings": [{
             "type": "analysis", "content": "The buyer should be screened.",
@@ -256,7 +370,7 @@ def test_overview_worker_task_records_input_ids_and_failure_stays_visible():
     ])
     caller = FakeCaller([json.dumps({"findings": [{
         "type": "entity_overview", "content": "Crestmoor Trading AG is the applicant [e1].",
-        "supports_entries": ["e1"],
+        "structured_overview": structured(("Crestmoor Trading AG is the applicant.", ["e1"], "fact")),
     }]})])
     output = execute_workers_parallel([{
         "expected_output_type": "entity_overview", "entity_overview_id": "crestmoor trading",
@@ -264,3 +378,52 @@ def test_overview_worker_task_records_input_ids_and_failure_stays_visible():
     }], board, caller)[0]
     assert output.entries[0].type == "entity_overview"
     assert output.task["entity_input_ids"] == ["e1"]
+    assert output.entries[0].supports_entries == ["e1"]
+    assert output.task["entity_structured_overview"]["entity_profiles"][0]["statements"][0]["supports_entries"] == ["e1"]
+
+
+def test_entity_overview_keeps_valid_statements_and_rejects_bad_references():
+    catalogue = NameCatalogue()
+    [entity_id] = catalogue.add(["Crestmoor Trading AG"])
+    cards = [
+        Entry(id="e1", content="Crestmoor Trading AG is the applicant."),
+        Entry(id="e2", content="Old overview", type="entity_overview"),
+        Entry(id="e3", content="Inactive source", status="inactive"),
+    ]
+    caller = FakeCaller([json.dumps({"findings": [{
+        "type": "entity_overview", "content": "ignored once structured",
+        "structured_overview": structured(
+            ("The company is the applicant.", ["e1"], "fact"),
+            ("This must be discarded.", ["e2", "e3", "missing"], "fact"),
+        ),
+    }]})])
+
+    output, _, _, state = run_entity_overview(catalogue, cards, entity_id, caller)
+
+    assert output[0].supports_entries == ["e1"]
+    assert "discarded" not in output[0].content
+    assert len(state["entity_profiles"][0]["statements"]) == 1
+
+
+def test_refresh_uses_changed_source_state_without_derived_trigger_and_keeps_old_state_in_prompt():
+    original = Entry(id="e1", content="Crestmoor Trading AG address is Zürich.", source=EntrySource("kyc", "s"))
+    state = {"variants": {"crestmoor trading": ["Crestmoor Trading AG"]}, "overviews": {
+        "crestmoor trading": {
+            "entry_id": "old", "input_ids": ["e1"], "source_states": {"e1": entry_state(original)},
+            "last_success_iteration": 1, "structured": structured(("Old address statement.", ["e1"], "fact")),
+        },
+    }}
+    changed = Entry(id="e1", content="Crestmoor Trading AG address is Geneva.", source=EntrySource("kyc", "s"))
+    derived = Entry(id="d1", content="Crestmoor Trading AG analysis changed.", type="analysis")
+    [item] = overview_inventory(state, [changed, derived], iteration=3)
+    assert item["suggestion"] == "refresh"
+    assert item["changed_source_ids"] == ["e1"]
+
+    catalogue = NameCatalogue({"crestmoor trading": {"Crestmoor Trading AG"}})
+    caller = FakeCaller([json.dumps({"findings": [{
+        "type": "entity_overview", "structured_overview": structured(("Address is Geneva.", ["e1"], "fact")),
+    }]})])
+    run_entity_overview(catalogue, [changed, derived], "crestmoor trading", caller,
+                        iteration=3, previous_state=state["overviews"]["crestmoor trading"]["structured"])
+    assert "REFRESH: Previous structured state follows" in caller.prompts[0]
+    assert "Old address statement" in caller.prompts[0]
