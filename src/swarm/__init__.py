@@ -46,6 +46,7 @@ from .synthesis_packet import (
     build_synthesis_packet,
     consolidate_items,
     filter_evidence_entries,
+    project_overview_statements,
     write_synthesis_packet_report,
 )
 from .synthesis import (
@@ -710,6 +711,10 @@ def run_swarm(task: Task, caller: ModelCaller, *,
                 combined.append(m)
                 seen.add(key)
         must_include = combined
+
+    # Overview records are derived context only. Project their validated statements
+    # onto their original evidence cards before the packet is assembled.
+    must_include.extend(project_overview_statements(blackboard))
 
     deliverables_map = task.metadata.get("deliverables", {})
     artifact_commitments = build_artifact_commitments(blackboard, deliverables_map)

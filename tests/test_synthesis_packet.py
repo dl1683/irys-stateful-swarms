@@ -1,11 +1,13 @@
 from src.swarm.blackboard import Blackboard
-from src.swarm.models import Entry, EntrySource
+from src.swarm.models import Entry, EntrySource, ModelResult
 from src.swarm.synthesis_packet import (
     build_synthesis_packet,
     consolidate_items,
     filter_evidence_entries,
     packet_items_for_file,
+    project_overview_statements,
 )
+from src.swarm.synthesis import _draft_synthesis
 
 
 def _bb_with_entries(entries):
@@ -140,6 +142,88 @@ def test_entity_overviews_do_not_enter_final_evidence():
     ], bb)
     evidence, _ = filter_evidence_entries(packet, entries)
     assert [entry.id for entry in evidence] == ["e2"]
+
+
+def test_overview_projection_preserves_original_sources_and_open_issues():
+    entries = [
+        Entry(id="e1", type="observation", content="Crestmoor Ltd is incorporated in Cyprus.",
+              source=EntrySource("kyc.pdf", "Entity details", "Cyprus"), confidence=0.9),
+        Entry(id="e2", type="observation", content="Crestmoor Trade & Supply GmbH is a screening candidate.",
+              source=EntrySource("screening.pdf", "Candidate", "74% name match"), confidence=0.8),
+        Entry(id="e3", type="analysis", content="The candidate was cleared after identifier review.",
+              source=EntrySource("screening.pdf", "Disposition", "Cleared"), confidence=0.8),
+        Entry(id="e4", type="observation", content="Petrov has conflicting dates of birth.",
+              source=EntrySource("case-notes.pdf", "Identity", "1968 and 1975"), confidence=0.7),
+        Entry(id="ov1", type="entity_overview", content="Derived overview", confidence=0.9),
+    ]
+    bb = _bb_with_entries(entries)
+    bb.entity_overview_state = {"overviews": {
+        "crestmoor": {
+            "entry_id": "ov1",
+            "structured": {
+                "entity_profiles": [{"label": "Crestmoor Ltd", "statements": [{
+                    "text": "Crestmoor Ltd is incorporated in Cyprus.",
+                    "supports_entries": ["e1"], "kind": "fact",
+                }]}],
+                "relationships_and_distinctions": [{"label": "Screening", "statements": [{
+                    "text": "Crestmoor Trade & Supply GmbH is a separate screening candidate cleared after identifier review.",
+                    "supports_entries": ["e2", "e3"], "kind": "derived",
+                }]}],
+                "unresolved_or_conflicting_evidence": [{"label": "Petrov", "statements": [{
+                    "text": "Petrov's 1968 and 1975 dates of birth remain unresolved.",
+                    "supports_entries": ["e4"], "kind": "unresolved",
+                }]}],
+            },
+        },
+    }}
+
+    projected = project_overview_statements(bb)
+    # Ordinary curation may select the same underlying card; packet deduplication
+    # should preserve one report row rather than duplicate the overview statement.
+    packet = build_synthesis_packet(projected + [{
+        "entry_id": "e1", "summary": "Crestmoor Ltd is incorporated in Cyprus.",
+        "section": "Entity Profiles",
+    }], bb)
+    assert {row["section"] for row in packet} == {
+        "Entity Profiles", "Entity Relationships and Distinctions", "Open Issues",
+    }
+    assert all("ov1" not in row["entry_ids"] for row in packet)
+    assert all(row["overview_lineage"] == ["ov1"] for row in packet)
+    assert {ref for row in packet for ref in row["required_source_refs"]} == {
+        "kyc.pdf / Entity details", "screening.pdf / Candidate",
+        "screening.pdf / Disposition", "case-notes.pdf / Identity",
+    }
+    unresolved = next(row for row in packet if row["section"] == "Open Issues")
+    assert unresolved["open_issue_only"] is True
+    evidence, open_issues = filter_evidence_entries(packet, bb.entries)
+    assert "ov1" not in {entry.id for entry in evidence}
+    assert [row["summary"] for row in open_issues] == [unresolved["summary"]]
+
+    class DraftCaller:
+        def __init__(self):
+            self.prompt = ""
+
+        def complete(self, prompt, **_kwargs):
+            self.prompt = prompt
+            return ModelResult("assembled report", 1, 1, 2, "fake", 1)
+
+    caller = DraftCaller()
+    draft, _ = _draft_synthesis(bb, packet, bb.entries, caller)
+    assert draft == "assembled report"
+    assert "[Entity Profiles] Crestmoor Ltd is incorporated in Cyprus." in caller.prompt
+    assert "[Entity Relationships and Distinctions] Crestmoor Trade & Supply GmbH" in caller.prompt
+    assert "[OPEN ISSUE] Petrov's 1968 and 1975 dates of birth remain unresolved." in caller.prompt
+    assert "[ov1]" not in caller.prompt
+
+
+def test_consolidate_does_not_merge_overview_projection_rows():
+    items = [
+        {"entry_id": "e1", "section": "Entity Profiles", "source": "entity_overview_projection",
+         "summary": "Petrov date of birth is 1968", "overview_kind": "fact"},
+        {"entry_id": "e2", "section": "Entity Profiles", "source": "entity_overview_projection",
+         "summary": "Petrov date of birth is 1975", "overview_kind": "fact"},
+    ]
+    assert len(consolidate_items(items, similarity_threshold=0.1)) == 2
 
 
 def test_artifact_contract_items_preserved():
