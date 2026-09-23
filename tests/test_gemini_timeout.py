@@ -1,7 +1,7 @@
 import time
 
 from src.providers.gemini import GeminiCaller
-from src.providers.gemini import _RequestLimiter
+from src.providers.gemini import _RequestLimiter, _retry_delay
 
 
 class HangingModels:
@@ -107,3 +107,9 @@ def test_request_limiter_enforces_hard_cap(monkeypatch):
         assert "cap reached" in str(exc)
     else:
         raise AssertionError("Expected request cap")
+
+
+def test_configured_retry_delay_is_fixed(monkeypatch):
+    monkeypatch.setenv("GEMINI_RETRY_DELAY_SECONDS", "20")
+    assert _retry_delay(RuntimeError("retry in 2s"), 0) == 20
+    assert _retry_delay(RuntimeError("503 unavailable"), 4) == 20

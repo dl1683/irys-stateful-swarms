@@ -10,9 +10,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# This runner is intentionally finite, including provider-level transient retries.
-os.environ.setdefault("GEMINI_MAX_REQUESTS", "4")
-
 from src.ingestion import ingest_file
 from src.swarm.blackboard import Blackboard
 from src.swarm.entity_overview import (
@@ -29,17 +26,21 @@ from src.swarm.models import Entry, EntrySource, WorkerRecord
 from src.swarm.orchestrator import run_orchestrator
 from src.swarm.synthesis_packet import build_synthesis_packet, project_overview_statements
 from src.swarm.worker_dispatch import call_model, execute_workers_parallel
-from src.providers.gemini import GeminiCaller
 
 
 class RecordingCaller:
     """Save the exact checkpoint inputs, outputs, and usage without logging credentials."""
 
-    def __init__(self, caller):
+    def __init__(self, caller, max_calls: int = 4):
         self.caller = caller
+        self.max_calls = max_calls
+        self.logical_calls = 0
         self.calls: list[dict] = []
 
     def complete(self, prompt, *, max_tokens=8192, temperature=0.05, json_mode=True):
+        self.logical_calls += 1
+        if self.logical_calls > self.max_calls:
+            raise RuntimeError(f"logical model-call cap reached ({self.max_calls} calls)")
         try:
             result = self.caller.complete(
                 prompt, max_tokens=max_tokens, temperature=temperature, json_mode=json_mode,
@@ -284,6 +285,8 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=True)
 
     if args.freshness_checkpoint:
+        os.environ["GEMINI_RETRY_DELAY_SECONDS"] = "20"
+        from src.providers.gemini import GeminiCaller
         caller = None if args.dry_run else RecordingCaller(GeminiCaller(model="gemini-3.1-flash-lite"))
         report = {}
         try:
@@ -314,6 +317,7 @@ def main() -> None:
     refresh_only = bool(args.refresh_artifact)
     cards = (_snapshot_cards(args.blackboard, args.entry_ids.split(",")) if replay
              else _fixture_cards(args.task_dir))
+    from src.providers.gemini import GeminiCaller
     caller = RecordingCaller(GeminiCaller(model="gemini-3.1-flash-lite"))
 
     report = {

@@ -48,6 +48,8 @@ _GEMINI_LIMITER = _RequestLimiter(
 
 
 def _retry_delay(error: Exception, attempt: int) -> int:
+    if configured := os.environ.get("GEMINI_RETRY_DELAY_SECONDS"):
+        return max(1, math.ceil(float(configured)))
     match = re.search(r"retry in\s+([0-9]+(?:\.[0-9]+)?)s", str(error), re.IGNORECASE)
     if match:
         return max(1, math.ceil(float(match.group(1))))
