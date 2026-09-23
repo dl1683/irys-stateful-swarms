@@ -24,8 +24,9 @@ selection reasons, and final attempts.
   Inactive support was excluded from both worker attachment and packet projection.
 - Real model: the September 22 finite checkpoint produced no usable model
   response. In the final attempt, two logical refresh calls made ten provider
-  attempts total; all returned Gemini `503 UNAVAILABLE` high-demand errors after
-  the configured 20-second retry waits. The downstream worker and draft were not
+  attempts total; each logical call ended with a Gemini `503 UNAVAILABLE`
+  high-demand error after the configured 20-second retry waits. Individual
+  attempt errors were not recorded. The downstream worker and draft were not
   reached. [Attempt record](../../../.protopowers/runs/2026-09-23-entity-overview-freshness/live-20260923-3/entity_overview_freshness.json).
 
 ## Limits and next experiment
