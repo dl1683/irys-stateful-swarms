@@ -1,6 +1,6 @@
 import pytest
 
-from scripts.run_entity_overview_live import RecordingCaller
+from scripts.run_entity_overview_live import RecordingCaller, _separate_screening_rows
 
 
 class FailingCaller:
@@ -28,3 +28,11 @@ def test_recording_caller_caps_logical_calls_not_provider_retries():
         caller.complete("first")
     with pytest.raises(RuntimeError, match="logical model-call cap reached"):
         caller.complete("second")
+
+
+def test_final_checkpoint_accepts_separate_sanctions_profile_label():
+    packet = [
+        {"overview_group_label": "Nikolai V. Petrov (UBO/Client)"},
+        {"overview_group_label": "Nikolai Vladimirovich Petrov (Sanctioned Entity)"},
+    ]
+    assert _separate_screening_rows(packet) == [packet[1]]

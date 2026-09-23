@@ -28,6 +28,21 @@ selection reasons, and final attempts.
   high-demand error after the configured 20-second retry waits. Individual
   attempt errors were not recorded. The downstream worker and draft were not
   reached. [Attempt record](../../../.protopowers/runs/2026-09-23-entity-overview-freshness/live-20260923-3/entity_overview_freshness.json).
+- Real model, Gemini 3.5 Flash-Lite: the bounded Task 1 checkpoint completed four
+  logical calls, each in one provider attempt. Both refreshed personal overviews,
+  the ordinary worker, and the short draft completed. The labelled packet places
+  Petrov's Swiss permanent residency and Volkov's UAE residency under the
+  respective subjects and retains distinct screening profiles. The draft states
+  both residency facts. [Task 1 record](../../../.protopowers/runs/2026-09-23-entity-overview-freshness/live-20260923-gemini35-task1/entity_overview_freshness.json).
+- Real model, Gemini 3.5 Flash-Lite: the Task 2 final pass used one logical call
+  and one provider attempt on a saved Petrov slice with exactly one new direct
+  source card, below the routine four-card trigger. It published a new overview;
+  the packet attaches Swiss permanent residency to the client/UBO profile and
+  keeps the sanctioned namesake in separate labelled rows. The command initially
+  exited with a false-negative verifier error because it only recognized the word
+  “candidate,” whereas the model labelled the separate profile “Sanctioned
+  Entity.” The saved live response passed the corrected verifier offline; no paid
+  rerun was made. [Task 2 record](../../../.protopowers/runs/2026-09-23-entity-overview-freshness/live-20260923-gemini35-task2/entity_overview_freshness.json).
 
 ## Limits and next experiment
 
@@ -39,6 +54,5 @@ provider billing tokens remain the source of truth after each call. No full swar
 or judge run was launched. Repeated trust, vessel-history, and identity
 investigations must be reviewed in the next authorized evaluation for added
 evidence, corrections, or confusion. If the user elects a wider evaluation,
-reconsider report deduplication then. The most useful next live experiment is the
-same four logical calls after Gemini availability recovers, followed by inspection
-of both residency facts and candidate distinctions in the draft.
+reconsider report deduplication then. These finite checkpoints show the named
+paths, not full-run report quality or repeated-investigation behavior.

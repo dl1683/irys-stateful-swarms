@@ -66,6 +66,13 @@ class RecordingCaller:
         return result
 
 
+def _separate_screening_rows(packet: list[dict]) -> list[dict]:
+    """Accept candidate and sanctions-list profile labels as distinct people."""
+    return [row for row in packet if any(term in
+            str(row.get("overview_group_label", "")).casefold()
+            for term in ("candidate", "sanctioned entity"))]
+
+
 def _fixture_cards(task_dir: Path) -> list[Entry]:
     """Use the configured sanctions documents, retaining only a finite Crestmoor fixture."""
     selected = [
@@ -283,8 +290,7 @@ def _run_final_freshness_checkpoint(args, caller: RecordingCaller | None) -> dic
     new_id = board.entity_overview_state["overviews"][entity_id]["entry_id"]
     subject_rows = [row for row in packet if late_id in row["entry_ids"]
                     and "petrov" in str(row.get("overview_group_label", "")).casefold()]
-    candidate_rows = [row for row in packet if "candidate" in
-                      str(row.get("overview_group_label", "")).casefold()]
+    candidate_rows = _separate_screening_rows(packet)
     report.update({
         "inventory_after": overview_inventory(board.entity_overview_state, board.entries, iteration),
         "final_candidates": state.get("final_candidates", []),
