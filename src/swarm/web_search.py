@@ -1,4 +1,4 @@
-"""DuckDuckGo web search for the swarm â€” free, no API key required.
+"""DuckDuckGo web search for the swarm — free, no API key required.
 
 Ported from Swarm Studio. Synchronous (workers run in ThreadPoolExecutor).
 Enable via SWARM_WEB_SEARCH=1 environment variable.
@@ -8,6 +8,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import socket
 import time
 from urllib.parse import urlparse
 
@@ -118,9 +119,11 @@ def _ddg_search(query: str, max_results: int) -> list[dict]:
 
 
 def _is_safe_url(url: str) -> bool:
-    """Block SSRF: reject localhost, private IPs, and metadata endpoints."""
+    """Block SSRF: reject non-HTTP schemes, unresolvable hosts, private IPs, and metadata endpoints."""
     try:
         parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
         hostname = parsed.hostname or ""
     except Exception:
         return False
@@ -137,11 +140,29 @@ def _is_safe_url(url: str) -> bool:
     if hostname.startswith("169.254."):
         return False
 
+    # Check direct literal IP
     try:
         addr = ipaddress.ip_address(hostname)
         if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
             return False
+        return True
     except ValueError:
         pass
+
+    # Resolve hostname via DNS and check all resolved IP addresses
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        addr_info = socket.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP)
+        if not addr_info:
+            return False
+
+        for item in addr_info:
+            sockaddr = item[4]
+            ip_str = sockaddr[0]
+            ip = ipaddress.ip_address(ip_str)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                return False
+    except (socket.gaierror, socket.herror, ValueError):
+        return False
 
     return True
