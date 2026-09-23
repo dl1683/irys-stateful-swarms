@@ -60,7 +60,9 @@ def project_overview_statements(blackboard: Blackboard) -> list[dict]:
                         entry_id for entry_id in supports
                         if isinstance(entry_id, str) and entry_id in active_original_ids
                     ))
-                    if not entry_ids:
+                    # Partial support loss can make an old assertion false; retain
+                    # the original cards elsewhere, but do not project that claim.
+                    if not entry_ids or len(entry_ids) != len(set(supports)):
                         continue
                     kind = str(statement.get("kind", "fact")).lower()
                     projected.append({

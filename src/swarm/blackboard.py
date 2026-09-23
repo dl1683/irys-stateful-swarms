@@ -269,6 +269,8 @@ class Blackboard:
         # Keep a stable, small summary beside snapshots so capped runs are inspectable.
         entity_state = self.entity_overview_state
         if entity_state:
+            from .entity_overview import overview_inventory
+            inventory = overview_inventory(entity_state, self.entries, self.iteration)
             variants = entity_state.get("variants", {})
             overviews = entity_state.get("overviews", {})
             report = {
@@ -286,7 +288,15 @@ class Blackboard:
                 ),
                 "failed": entity_state.get("failed", []),
                 "initial_backlog": entity_state.get("initial_queue", []),
+                "eligible_initial_backlog": [item["entity_id"] for item in inventory
+                                             if item["eligibility"] == "initial"],
+                "eligible_refresh_backlog": [item["entity_id"] for item in inventory
+                                             if item["eligibility"] == "refresh"],
                 "scheduled": entity_state.get("pending", []),
+                "budget_limited": entity_state.get("budget_limited", []),
+                "freshness_failures": entity_state.get("freshness_failures", []),
+                "final_candidates": entity_state.get("final_candidates", []),
+                "final_attempted": entity_state.get("final_attempted", []),
                 "selection_log": entity_state.get("selection_log", []),
                 "deferred": entity_state.get("deferred", []),
                 "rejected_requests": entity_state.get("rejected_requests", []),

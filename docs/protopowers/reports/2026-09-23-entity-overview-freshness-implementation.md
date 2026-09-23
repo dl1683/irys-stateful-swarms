@@ -1,0 +1,43 @@
+# Entity overview freshness implementation checkpoint
+
+Task 1 scheduling and labelled transfer are committed in `75b1174`. The live
+runner fixes are committed in `e7f37e7` and `056a91d`. Task 2 extends the same
+request, scheduling, publication, and recipient path to supervisor rounds. A
+frozen final pass attempts affected overviews once, in batches of at most three,
+after evidence-producing stages and before synthesis projection. It includes a
+single late direct-document finding below the routine four-card threshold. The
+sidecar now shows eligible backlog, scheduled work, failures, budget-limited work,
+selection reasons, and final attempts.
+
+## Evidence
+
+- Offline: 80 focused overview, packet, and synthesis tests passed. A fake-model
+  lifecycle introduced one Swiss residency card during supervisor work, refreshed
+  the Petrov profile in the final pass, and projected a subject-labelled row
+  supported by the original card. The screening candidate remained separate.
+  [Before supervisor](../../../.protopowers/runs/2026-09-23-entity-overview-freshness/pytest-task2-verified/test_supervisor_attachment_the0/swarm/blackboard_iter_5_before_supervisor.json),
+  [after supervisor](../../../.protopowers/runs/2026-09-23-entity-overview-freshness/pytest-task2-verified/test_supervisor_attachment_the0/swarm/blackboard_iter_5_after_supervisor.json),
+  [final state](../../../.protopowers/runs/2026-09-23-entity-overview-freshness/pytest-task2-verified/test_supervisor_attachment_the0/swarm/blackboard_iter_5_final_check.json),
+  and [packet](../../../.protopowers/runs/2026-09-23-entity-overview-freshness/pytest-task2-verified/test_supervisor_attachment_the0/packet.json).
+- Offline: an unusable refresh retained the prior valid record and reported the
+  failed group. A budget-limited pass made no model call and exposed the backlog.
+  Inactive support was excluded from both worker attachment and packet projection.
+- Real model: the September 22 finite checkpoint produced no usable model
+  response. In the final attempt, two logical refresh calls made ten provider
+  attempts total; all returned Gemini `503 UNAVAILABLE` high-demand errors after
+  the configured 20-second retry waits. The downstream worker and draft were not
+  reached. [Attempt record](../../../.protopowers/runs/2026-09-23-entity-overview-freshness/live-20260923-3/entity_overview_freshness.json).
+
+## Limits and next experiment
+
+The final pass treats the existing evidence catalogue as its relevance boundary.
+For much larger corpora, inspect whether this admits too many low-value groups
+before narrowing by task or artifact context. The budget check uses the actual
+constructed prompt's UTF-8 byte length plus the requested 8,192 output tokens;
+provider billing tokens remain the source of truth after each call. No full swarm
+or judge run was launched. Repeated trust, vessel-history, and identity
+investigations must be reviewed in the next authorized evaluation for added
+evidence, corrections, or confusion. If the user elects a wider evaluation,
+reconsider report deduplication then. The most useful next live experiment is the
+same four logical calls after Gemini availability recovers, followed by inspection
+of both residency facts and candidate distinctions in the draft.

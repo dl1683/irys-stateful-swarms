@@ -57,6 +57,7 @@ GUIDELINES:
 - CONVERGE when analysis entries exist AND new iterations yield diminishing returns (few new findings). Do not converge if only observations exist with no analysis/calculation entries.
 - EXTRACTION GAPS: If a document has many more items than we've extracted, dispatch targeted re-extraction
 - For a substantive entity-focused task, use an available overview ID in reads_from_blackboard.
+- Consult prior entity findings before assigning a repeat investigation. State whether the repeat checks another source, narrows extraction, resolves a contradiction, or independently verifies a claim. Repeats remain allowed when they can add evidence.
 - When the inventory suggests initial or refresh, you may commission exactly one worker with
   "expected_output_type": "entity_overview" and "entity_overview_id": its retrieval ID.
 """

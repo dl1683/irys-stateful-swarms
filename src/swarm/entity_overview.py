@@ -218,11 +218,12 @@ def overview_inventory(state: dict, entries: list[Entry], iteration: int = 999) 
         inactive_ids = [entry_id for entry_id in previous_ids
                         if entry_id not in by_id or by_id[entry_id].status != "active"]
         interval_ready = iteration - record.get("last_success_iteration", iteration - 2) >= 2
-        suggestion = ""
+        eligibility = ""
         if entity_id not in records and len(source_ids) >= INITIAL_OVERVIEW_CARDS:
-            suggestion = "initial"
+            eligibility = "initial"
         elif entity_id in records and interval_ready and (new_count >= REFRESH_OVERVIEW_CARDS or changed_ids or inactive_ids):
-            suggestion = "refresh"
+            eligibility = "refresh"
+        suggestion = eligibility
         if entity_id in pending or entity_id in failed:
             suggestion = ""
         inventory.append({
@@ -236,7 +237,7 @@ def overview_inventory(state: dict, entries: list[Entry], iteration: int = 999) 
             }),
             "inactive_support_ids": inactive_ids,
             "last_success_iteration": record.get("last_success_iteration", -1),
-            "suggestion": suggestion,
+            "eligibility": eligibility, "suggestion": suggestion,
         })
     return inventory
 
@@ -365,24 +366,36 @@ def resolve_overview_request(requested: object, inventory: list[dict], state: di
 
 def attach_relevant_overviews(tasks: list[dict], entries: list[Entry], state: dict) -> list[dict]:
     """Attach at most two evidence-overlapping overview entries to substantive work."""
+    by_id = {entry.id: entry for entry in entries}
     active_overviews = {
         entry.id for entry in entries
         if entry.type == "entity_overview" and entry.status == "active"
     }
     records = state.get("overviews", {})
+    stale_ids = {
+        record.get("entry_id", "") for record in records.values()
+        if any(
+            entry_id not in by_id or by_id[entry_id].status != "active"
+            or (entry_id in record.get("source_states", {})
+                and record["source_states"][entry_id] != entry_state(by_id[entry_id]))
+            for entry_id in record.get("input_ids", [])
+        )
+    }
     for task in tasks:
         if task.get("expected_output_type") == "entity_overview":
             continue
-        selected = set(task.get("reads_from_blackboard", []))
+        existing = list(dict.fromkeys(entry_id for entry_id in task.get("reads_from_blackboard", [])
+                                      if entry_id not in stale_ids))
+        task["reads_from_blackboard"] = existing
+        selected = set(existing)
         if not selected:
             continue
         candidates = []
         for entity_id, record in records.items():
             overview_id = record.get("entry_id", "")
             overlap = selected & set(record.get("input_ids", []))
-            if overview_id in active_overviews and len(overlap) >= 2:
+            if overview_id in active_overviews and overview_id not in stale_ids and len(overlap) >= 2:
                 candidates.append((len(overlap), entity_id, overview_id))
-        existing = list(dict.fromkeys(task.get("reads_from_blackboard", [])))
         attached = []
         for overlap, entity_id, overview_id in sorted(candidates, reverse=True)[:2]:
             if overview_id not in existing:
