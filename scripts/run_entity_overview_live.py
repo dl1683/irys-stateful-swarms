@@ -176,7 +176,7 @@ def _freshness_fixture(snapshot: Path) -> tuple[list[Entry], dict, int, list[dic
 def _run_freshness_checkpoint(args, caller: RecordingCaller | None) -> dict:
     cards, state, iteration, full_selection, overview_tasks = _freshness_fixture(args.blackboard)
     report = {
-        "model": "gemini-3.1-flash-lite", "requests_per_minute": 10,
+        "model": args.model, "requests_per_minute": 10,
         "snapshot": str(args.blackboard), "historical_snapshot_immutable": True,
         "iteration": iteration, "fixture_card_ids": [entry.id for entry in cards],
         "historical_direct_evidence_override": ["e392"],
@@ -251,6 +251,8 @@ def main() -> None:
     parser.add_argument("--task-dir", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--api-key-file", type=Path)
+    parser.add_argument("--model", default="gemini-3.1-flash-lite",
+                        help="Gemini model ID for live calls and artifact provenance.")
     parser.add_argument("--entity", default="crestmoor trading ag")
     parser.add_argument("--blackboard", type=Path,
                         help="Saved blackboard for a two-call finite replay.")
@@ -287,13 +289,13 @@ def main() -> None:
     if args.freshness_checkpoint:
         os.environ["GEMINI_RETRY_DELAY_SECONDS"] = "20"
         from src.providers.gemini import GeminiCaller
-        caller = None if args.dry_run else RecordingCaller(GeminiCaller(model="gemini-3.1-flash-lite"))
+        caller = None if args.dry_run else RecordingCaller(GeminiCaller(model=args.model))
         report = {}
         try:
             report = _run_freshness_checkpoint(args, caller)
         except Exception as exc:
             report = {
-                "model": "gemini-3.1-flash-lite", "snapshot": str(args.blackboard),
+                "model": args.model, "snapshot": str(args.blackboard),
                 "dry_run": args.dry_run, "error": str(exc),
                 "calls": caller.calls if caller else [],
             }
@@ -318,10 +320,10 @@ def main() -> None:
     cards = (_snapshot_cards(args.blackboard, args.entry_ids.split(",")) if replay
              else _fixture_cards(args.task_dir))
     from src.providers.gemini import GeminiCaller
-    caller = RecordingCaller(GeminiCaller(model="gemini-3.1-flash-lite"))
+    caller = RecordingCaller(GeminiCaller(model=args.model))
 
     report = {
-        "model": "gemini-3.1-flash-lite",
+        "model": args.model,
         "requests_per_minute": 10,
         "fixture_card_ids": [entry.id for entry in cards], "replay": replay, "refresh_only": refresh_only,
     }
