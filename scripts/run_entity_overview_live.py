@@ -14,6 +14,7 @@ from src.ingestion import ingest_file
 from src.swarm.blackboard import Blackboard
 from src.swarm.entity_overview import (
     NameCatalogue,
+    automatic_overview_tasks,
     build_name_discovery_prompt,
     normalize_name,
     overview_inventory,
@@ -21,8 +22,9 @@ from src.swarm.entity_overview import (
     record_discovered_names,
     prepare_overview_tasks,
 )
-from src.swarm.models import Entry, EntrySource
+from src.swarm.models import Entry, EntrySource, WorkerRecord
 from src.swarm.orchestrator import run_orchestrator
+from src.swarm.synthesis_packet import build_synthesis_packet, project_overview_statements
 from src.swarm.worker_dispatch import call_model, execute_workers_parallel
 from src.providers.gemini import GeminiCaller
 
@@ -94,11 +96,136 @@ def _snapshot_cards(snapshot: Path, entry_ids: list[str]) -> list[Entry]:
     return cards
 
 
+def _saved_entry(raw: dict) -> Entry:
+    source = raw.get("source")
+    worker = raw.get("created_by") or {}
+    return Entry(
+        id=str(raw.get("id", "")), type=str(raw.get("type", "observation")),
+        content=str(raw.get("content", "")),
+        source=EntrySource(**source) if isinstance(source, dict) else None,
+        created_by=WorkerRecord(
+            str(worker.get("worker_id", "")), str(worker.get("description", "")),
+            int(worker.get("iteration", 0)),
+        ),
+        confidence=float(raw.get("confidence", 0.5)), status=str(raw.get("status", "active")),
+        supports_entries=list(raw.get("supports", [])),
+        supersedes_entries=list(raw.get("supersedes", [])),
+    )
+
+
+def _freshness_fixture(snapshot: Path) -> tuple[list[Entry], dict, int, list[dict], list[dict]]:
+    """Load the saved run, show global fairness, then bound live work to two people."""
+    saved = json.loads(snapshot.read_text(encoding="utf-8"))
+    entries = [_saved_entry(raw) for raw in saved.get("entries", [])]
+    state = json.loads(json.dumps(saved.get("entity_overview_state", {})))
+    state["pending"] = []
+    state["failed"] = []
+    state["initial_queue"] = []
+    # Historical snapshots predate direct-read bookkeeping. These inspected cards
+    # carry quoted document evidence; keep the explicit list visible in the artifact.
+    direct_ids = [
+        entry.id for entry in entries
+        if entry.type == "observation" and entry.source and entry.source.document
+    ] + ["e392"]
+    state["direct_source_entry_ids"] = list(dict.fromkeys(direct_ids))
+    iteration = int(saved.get("iteration", 0))
+
+    full_inventory = overview_inventory(state, entries, iteration)
+    selection_state = json.loads(json.dumps(state))
+    full_selection = automatic_overview_tasks(full_inventory, selection_state, iteration)
+
+    personal_ids = ["nikolai v petrov", "dmitri k volkov"]
+    missing = [entity_id for entity_id in personal_ids if entity_id not in state.get("overviews", {})]
+    if missing:
+        raise ValueError(f"snapshot is missing personal overview state: {', '.join(missing)}")
+    compact_state = {
+        "variants": {entity_id: state["variants"][entity_id] for entity_id in personal_ids},
+        "overviews": {entity_id: state["overviews"][entity_id] for entity_id in personal_ids},
+        "direct_source_entry_ids": state["direct_source_entry_ids"],
+        "pending": [], "failed": [], "initial_queue": [],
+    }
+    relevant_ids = set()
+    full_by_id = {item["entity_id"]: item for item in full_inventory}
+    for entity_id in personal_ids:
+        relevant_ids.update(compact_state["overviews"][entity_id].get("input_ids", []))
+        relevant_ids.update(full_by_id[entity_id].get("source_card_ids", []))
+    compact_entries = [
+        entry for entry in entries
+        if entry.id in relevant_ids and entry.status == "active" and entry.type != "entity_overview"
+    ]
+    compact_inventory = overview_inventory(compact_state, compact_entries, iteration)
+    compact_tasks = automatic_overview_tasks(compact_inventory, compact_state, iteration)
+    if {task["entity_overview_id"] for task in compact_tasks} != set(personal_ids):
+        raise ValueError("bounded personal fixture did not select both refreshes")
+    return compact_entries, compact_state, iteration, full_selection, compact_tasks
+
+
+def _run_freshness_checkpoint(args, caller: RecordingCaller | None) -> dict:
+    cards, state, iteration, full_selection, overview_tasks = _freshness_fixture(args.blackboard)
+    report = {
+        "model": "gemini-3.1-flash-lite", "requests_per_minute": 10,
+        "snapshot": str(args.blackboard), "historical_snapshot_immutable": True,
+        "iteration": iteration, "fixture_card_ids": [entry.id for entry in cards],
+        "historical_direct_evidence_override": ["e392"],
+        "full_selection": full_selection, "bounded_personal_selection": overview_tasks,
+        "dry_run": args.dry_run,
+    }
+    if args.dry_run:
+        report["calls"] = []
+        return report
+
+    board = Blackboard(
+        task_instruction="Extract current personal residency and sanctions-screening distinctions.",
+        entries=cards, iteration=iteration, entity_overview_state=state,
+    )
+    outputs = execute_workers_parallel(overview_tasks, board, caller)
+    if len(outputs) != 2 or any(not output.entries for output in outputs):
+        raise ValueError("both bounded personal overview refreshes must succeed")
+    for output in outputs:
+        board.add_entries_batch(output.entries)
+        entity_id = output.task["entity_overview_id"]
+        prior = board.entity_overview_state["overviews"][entity_id]
+        board.entity_overview_state["overviews"][entity_id] = {
+            **prior, "entry_id": next(e.id for e in output.entries if e.type == "entity_overview"),
+            "input_ids": output.task["entity_input_ids"],
+            "structured": output.task["entity_structured_overview"],
+            "last_success_iteration": iteration,
+        }
+    overview_ids = [
+        board.entity_overview_state["overviews"][entity_id]["entry_id"]
+        for entity_id in ("nikolai v petrov", "dmitri k volkov")
+    ]
+    [worker] = execute_workers_parallel([{
+        "description": "State each person's supported residency and keep screening candidates distinct.",
+        "reads_from_blackboard": overview_ids, "reads_from_documents": [],
+        "expected_output_type": "analysis", "priority": "high",
+    }], board, caller)
+    board.add_entries_batch(worker.entries)
+    packet = build_synthesis_packet(project_overview_statements(board), board)
+    packet_text = "\n".join(
+        f"- [{row.get('overview_group_label')}] {row['summary']} (supports: {', '.join(row['entry_ids'])})"
+        for row in packet
+    )
+    draft_payload, draft_tokens = call_model(caller, f"""Write a concise evidence-grounded paragraph.
+Keep Nikolai V. Petrov and Dmitri K. Volkov separate from their screening candidates.
+Retain each subject label and state supported residency facts. Do not infer missing facts.
+
+LABELLED PACKET ROWS:
+{packet_text}""", json_mode=False)
+    report.update({
+        "overview_outputs": [e.to_dict() for output in outputs for e in output.entries],
+        "downstream_entries": [e.to_dict() for e in worker.entries],
+        "packet": packet, "draft": draft_payload.get("text", ""),
+        "draft_tokens": draft_tokens, "calls": caller.calls,
+    })
+    return report
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--task-dir", type=Path)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--api-key-file", type=Path, required=True)
+    parser.add_argument("--api-key-file", type=Path)
     parser.add_argument("--entity", default="crestmoor trading ag")
     parser.add_argument("--blackboard", type=Path,
                         help="Saved blackboard for a two-call finite replay.")
@@ -108,18 +235,54 @@ def main() -> None:
                         help="Candidate spelling for the replay retrieval group; repeat as needed.")
     parser.add_argument("--refresh-artifact", type=Path,
                         help="Prior live artifact; makes one refresh call and skips downstream work.")
+    parser.add_argument("--freshness-checkpoint", action="store_true",
+                        help="Use saved September evidence for the bounded four-call checkpoint.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Resolve and save selections without making provider calls.")
     args = parser.parse_args()
 
-    if bool(args.blackboard) != bool(args.entry_ids):
+    if not args.freshness_checkpoint and bool(args.blackboard) != bool(args.entry_ids):
         parser.error("--blackboard and --entry-ids must be used together")
-    if not args.blackboard and not args.task_dir:
+    if args.freshness_checkpoint and not args.blackboard:
+        parser.error("--freshness-checkpoint requires --blackboard")
+    if not args.freshness_checkpoint and not args.blackboard and not args.task_dir:
         parser.error("--task-dir is required unless replaying --blackboard entries")
     if args.refresh_artifact and not args.blackboard:
         parser.error("--refresh-artifact requires --blackboard replay")
 
-    os.environ["GEMINI_API_KEY"] = args.api_key_file.read_text(encoding="utf-8").strip()
-    os.environ["GEMINI_REQUESTS_PER_MINUTE"] = "10"
+    if not args.dry_run:
+        if not args.api_key_file:
+            parser.error("--api-key-file is required for live calls")
+        os.environ["GEMINI_API_KEY"] = args.api_key_file.read_text(encoding="utf-8").strip()
+        os.environ["GEMINI_REQUESTS_PER_MINUTE"] = "10"
+    if args.output.exists() and any(args.output.iterdir()):
+        parser.error("--output must be a new or empty attempt directory")
     args.output.mkdir(parents=True, exist_ok=True)
+
+    if args.freshness_checkpoint:
+        caller = None if args.dry_run else RecordingCaller(GeminiCaller(model="gemini-3.1-flash-lite"))
+        report = {}
+        try:
+            report = _run_freshness_checkpoint(args, caller)
+        except Exception as exc:
+            report = {
+                "model": "gemini-3.1-flash-lite", "snapshot": str(args.blackboard),
+                "dry_run": args.dry_run, "error": str(exc),
+                "calls": caller.calls if caller else [],
+            }
+            raise
+        finally:
+            (args.output / "entity_overview_freshness.json").write_text(
+                json.dumps(report, indent=2), encoding="utf-8",
+            )
+        print(json.dumps({
+            "saved": str(args.output / "entity_overview_freshness.json"),
+            "calls": len(report["calls"]),
+            "bounded_personal_selection": [
+                task["entity_overview_id"] for task in report["bounded_personal_selection"]
+            ],
+        }))
+        return
 
     replay = bool(args.blackboard)
     refresh_only = bool(args.refresh_artifact)

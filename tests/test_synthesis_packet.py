@@ -178,6 +178,9 @@ def test_overview_projection_preserves_original_sources_and_open_issues():
     }}
 
     projected = project_overview_statements(bb)
+    assert [item["overview_group_label"] for item in projected] == [
+        "Crestmoor Ltd", "Screening", "Petrov",
+    ]
     # Ordinary curation may select the same underlying card; packet deduplication
     # should preserve one report row rather than duplicate the overview statement.
     packet = build_synthesis_packet(projected + [{
@@ -210,9 +213,11 @@ def test_overview_projection_preserves_original_sources_and_open_issues():
     caller = DraftCaller()
     draft, _ = _draft_synthesis(bb, packet, bb.entries, caller)
     assert draft == "assembled report"
-    assert "[Entity Profiles] Crestmoor Ltd is incorporated in Cyprus." in caller.prompt
-    assert "[Entity Relationships and Distinctions] Crestmoor Trade & Supply GmbH" in caller.prompt
-    assert "[OPEN ISSUE] Petrov's 1968 and 1975 dates of birth remain unresolved." in caller.prompt
+    assert "[Entity Profiles] [Subject: Crestmoor Ltd] Crestmoor Ltd is incorporated in Cyprus." in caller.prompt
+    assert "[Subject: Screening] Crestmoor Trade & Supply GmbH" in caller.prompt
+    assert "[OPEN ISSUE] [Subject: Petrov]" in caller.prompt
+    assert "[Entity Relationships and Distinctions] [Subject: Screening] Crestmoor Trade & Supply GmbH" in caller.prompt
+    assert "[OPEN ISSUE] [Subject: Petrov] Petrov's 1968 and 1975 dates of birth remain unresolved." in caller.prompt
     assert "[ov1]" not in caller.prompt
 
 

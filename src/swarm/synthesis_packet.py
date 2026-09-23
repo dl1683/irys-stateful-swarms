@@ -48,6 +48,7 @@ def project_overview_statements(blackboard: Blackboard) -> list[dict]:
             for group in groups:
                 if not isinstance(group, dict) or not isinstance(group.get("statements"), list):
                     continue
+                label = str(group.get("label", "")).strip() or "Unlabelled entity profile"
                 for statement in group["statements"]:
                     if not isinstance(statement, dict):
                         continue
@@ -69,6 +70,7 @@ def project_overview_statements(blackboard: Blackboard) -> list[dict]:
                         "importance": "high" if kind == "unresolved" else "medium",
                         "source": OVERVIEW_PROJECTION_SOURCE,
                         "overview_kind": "unresolved" if section_key == "unresolved_or_conflicting_evidence" else kind,
+                        "overview_group_label": label,
                         "overview_lineage": [overview_id],
                     })
     return projected
@@ -139,6 +141,7 @@ def _normalize_item(item: dict, by_id: dict[str, Entry]) -> dict:
         "satisfaction_conditions": item.get("satisfaction_conditions", []),
         "evidence_entry_ids": item.get("evidence_entry_ids", []),
         "overview_kind": item.get("overview_kind", ""),
+        "overview_group_label": item.get("overview_group_label", ""),
         "overview_lineage": item.get("overview_lineage", []),
     }
 

@@ -118,6 +118,15 @@ def entry_state(entry: Entry) -> str:
     return sha256(f"{entry.status}\0{source}\0{entry.content}".encode()).hexdigest()
 
 
+def _is_qualifying_source(entry: Entry, state: dict) -> bool:
+    """Count direct document findings, not later analysis that inherited a source."""
+    if not entry.source or not entry.source.document:
+        return False
+    # Initial extraction observations are direct by construction. Other finding
+    # types qualify only when their worker actually read a document section.
+    return entry.type == "observation" or entry.id in state.get("direct_source_entry_ids", [])
+
+
 def record_discovered_names(state: dict, payload: dict, entries: list[Entry]) -> list[str]:
     """Apply source-backed alias links without extra calls or fuzzy group merging."""
     catalogue = _catalogue_from_state(state)
@@ -197,7 +206,7 @@ def overview_inventory(state: dict, entries: list[Entry], iteration: int = 999) 
     for entity_id in sorted(catalogue.variants):
         matched = catalogue.matched_entries(original, entity_id)
         matched_ids = [entry.id for entry, _ in matched]
-        source_backed = [entry for entry, _ in matched if entry.source and entry.source.document]
+        source_backed = [entry for entry, _ in matched if _is_qualifying_source(entry, state)]
         source_ids = [entry.id for entry in source_backed]
         source_documents = sorted({entry.source.document for entry in source_backed})
         record = records.get(entity_id, {})
@@ -221,13 +230,19 @@ def overview_inventory(state: dict, entries: list[Entry], iteration: int = 999) 
             "matched_card_ids": matched_ids, "overview_id": record.get("entry_id", ""),
             "source_card_ids": source_ids, "source_document_count": len(source_documents),
             "new_card_count": new_count, "changed_source_ids": changed_ids,
-            "inactive_support_ids": inactive_ids, "suggestion": suggestion,
+            "new_worker_count": len({
+                entry.created_by.worker_id for entry in source_backed
+                if entry.id not in previous_ids and entry.created_by.worker_id
+            }),
+            "inactive_support_ids": inactive_ids,
+            "last_success_iteration": record.get("last_success_iteration", -1),
+            "suggestion": suggestion,
         })
     return inventory
 
 
 def automatic_overview_tasks(inventory: list[dict], state: dict, iteration: int) -> list[dict]:
-    """Drain initial coverage in small batches, then allow one routine update."""
+    """Drain initial coverage, then select two evidence refreshes plus one by age."""
     pending = state.setdefault("pending", [])
     queue = state.setdefault("initial_queue", [])
     eligible_initial = [item["entity_id"] for item in inventory if item["suggestion"] == "initial"]
@@ -238,9 +253,46 @@ def automatic_overview_tasks(inventory: list[dict], state: dict, iteration: int)
 
     by_id = {item["entity_id"]: item for item in inventory}
     selected = queue[:INITIAL_OVERVIEW_BATCH_SIZE]
+    selection_pool = list(queue)
+    reasons = {entity_id: "initial coverage" for entity_id in selected}
     if not selected:
-        # After initial coverage, avoid spending more than one automatic call per iteration.
-        selected = [item["entity_id"] for item in inventory if item["suggestion"] == "refresh"][:1]
+        eligible = [item for item in inventory if item["suggestion"] == "refresh"]
+        selection_pool = [item["entity_id"] for item in eligible]
+        def refresh_unit(item: dict) -> tuple:
+            """Treat retrieval groups sharing one overview/evidence set as one update."""
+            if item.get("overview_id"):
+                return ("overview", item["overview_id"])
+            return ("evidence", *item.get("source_card_ids", []))
+
+        ranked = sorted(eligible, key=lambda item: (
+            not bool(item.get("changed_source_ids") or item.get("inactive_support_ids")),
+            -item.get("new_card_count", 0), -item.get("new_worker_count", 0),
+            item["entity_id"],
+        ))
+        evidence = []
+        selected_units = set()
+        for item in ranked:
+            unit = refresh_unit(item)
+            if unit in selected_units:
+                continue
+            evidence.append(item)
+            selected_units.add(unit)
+            if len(evidence) == 2:
+                break
+        selected = [item["entity_id"] for item in evidence]
+        reasons = {
+            item["entity_id"]: (
+                "changed or inactive support" if item.get("changed_source_ids") or item.get("inactive_support_ids")
+                else "new direct evidence"
+            ) for item in evidence
+        }
+        remaining = [item for item in eligible if refresh_unit(item) not in selected_units]
+        if remaining:
+            oldest = min(remaining, key=lambda item: (
+                item.get("last_success_iteration", -1), item["entity_id"],
+            ))
+            selected.append(oldest["entity_id"])
+            reasons[oldest["entity_id"]] = "oldest eligible overview"
     tasks = []
     covered = set()
     for entity_id in selected:
@@ -248,8 +300,14 @@ def automatic_overview_tasks(inventory: list[dict], state: dict, iteration: int)
         if not item or entity_id in pending or entity_id in covered:
             continue
         # Exact shared evidence is safe to batch; partial overlap stays separate.
-        group_ids = [other_id for other_id in queue
-                     if by_id.get(other_id, {}).get("source_card_ids") == item.get("source_card_ids")]
+        group_ids = [other_id for other_id in selection_pool if (
+            item.get("source_card_ids")
+            and by_id.get(other_id, {}).get("source_card_ids") == item.get("source_card_ids")
+            or (
+                item.get("overview_id")
+                and by_id.get(other_id, {}).get("overview_id") == item.get("overview_id")
+            )
+        )]
         group_ids = group_ids or [entity_id]
         covered.update(group_ids)
         for group_id in group_ids:
@@ -263,9 +321,46 @@ def automatic_overview_tasks(inventory: list[dict], state: dict, iteration: int)
             "reads_from_blackboard": [],
             "reads_from_documents": [], "priority": "high", "automatic_overview": True,
             "entity_refresh": item["suggestion"] == "refresh",
+            "overview_selection_reason": reasons[entity_id],
             "overview_queue_iteration": iteration,
         })
+        state.setdefault("selection_log", []).append({
+            "iteration": iteration, "entity_id": entity_id,
+            "group_ids": group_ids, "reason": reasons[entity_id],
+            "new_card_count": item.get("new_card_count", 0),
+            "new_worker_count": item.get("new_worker_count", 0),
+        })
     return tasks
+
+
+def resolve_overview_request(requested: object, inventory: list[dict], state: dict) -> tuple[str, str]:
+    """Resolve a retrieval key, current/old Entry ID, or unambiguous known name."""
+    value = str(requested or "").strip()
+    if not value:
+        return "", "missing or unavailable overview suggestion"
+    by_id = {item["entity_id"]: item for item in inventory}
+    if value in by_id:
+        return value, ""
+
+    id_matches = []
+    for entity_id, record in state.get("overviews", {}).items():
+        known_ids = {record.get("entry_id", ""), *record.get("superseded_entry_ids", [])}
+        if value in known_ids:
+            id_matches.append(entity_id)
+    if len(id_matches) == 1:
+        return id_matches[0], ""
+
+    normalized = normalize_name(value)
+    name_matches = [
+        item["entity_id"] for item in inventory
+        if normalized and any(normalize_name(name) == normalized for name in item.get("variants", []))
+    ]
+    matches = list(dict.fromkeys(id_matches or name_matches))
+    if len(matches) == 1:
+        return matches[0], ""
+    if len(matches) > 1:
+        return "", "ambiguous overview identifier"
+    return "", "unknown overview identifier"
 
 
 def attach_relevant_overviews(tasks: list[dict], entries: list[Entry], state: dict) -> list[dict]:
@@ -331,17 +426,19 @@ def prepare_overview_tasks(tasks: list[dict], inventory: list[dict], state: dict
         if task.get("expected_output_type") != "entity_overview":
             accepted.append(task)
             continue
-        entity_id = task.get("entity_overview_id")
+        requested_id = task.get("entity_overview_id")
+        entity_id, resolution_error = resolve_overview_request(requested_id, inventory, state)
         item = inventory_by_id.get(entity_id)
         if entity_id in state.get("pending", []) and not task.get("automatic_overview"):
             continue
-        if not item or (not item["suggestion"] and not item.get("matched_card_ids")):
+        if resolution_error or not item or (not item["suggestion"] and not item.get("matched_card_ids")):
             state.setdefault("rejected_requests", []).append({
                 "iteration": iteration,
-                "entity_id": entity_id,
-                "reason": "missing or unavailable overview suggestion",
+                "entity_id": requested_id,
+                "reason": resolution_error or "missing or unavailable overview suggestion",
             })
             continue
+        task["entity_overview_id"] = entity_id
         task["entity_variants"] = item["variants"]
         task["entity_refresh"] = item["suggestion"] == "refresh"
         if not item["suggestion"]:

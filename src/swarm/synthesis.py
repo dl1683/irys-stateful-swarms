@@ -1081,7 +1081,7 @@ def _format_selected_items(items: list[dict]) -> str:
     for i, item in enumerate(items, 1):
         section = item.get("section", "General")
         summary = _compact_selected_item_summary(
-            item.get("summary", ""),
+            _subject_labelled_summary(item),
             max_chars=SELECTED_ITEM_SUMMARY_CHARS,
         )
         entry_id = item.get("entry_id") or item.get("entry_ids", "")
@@ -1103,6 +1103,13 @@ def _compact_selected_item_summary(summary: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars].rstrip() + "..."
+
+
+def _subject_labelled_summary(item: dict) -> str:
+    """Expose an overview profile label to the writer without changing packet deduplication."""
+    summary = str(item.get("summary", "") or "")
+    label = str(item.get("overview_group_label", "") or "").strip()
+    return f"[Subject: {label}] {summary}" if label else summary
 
 
 def _format_artifact_commitment_inline(item: dict) -> str:
@@ -1583,7 +1590,7 @@ def _draft_synthesis(blackboard: Blackboard, must_include: list[dict],
             continue
         imp = m.get("importance", "high")
         section = m.get("section", "General")
-        summary = m.get("summary", "")
+        summary = _subject_labelled_summary(m)
         entry_id = m.get("entry_id", "")
         items_text_parts.append(f"{i}. [{imp}] [{section}] {summary} (ref: {entry_id})")
 
@@ -1593,7 +1600,7 @@ def _draft_synthesis(blackboard: Blackboard, must_include: list[dict],
     gaps_from_entries = [e.content for e in active if e.type == "gap"]
     open_issue_parts = [f"- {g}" for g in gaps_from_entries]
     for oi in open_issue_items:
-        open_issue_parts.append(f"- [OPEN ISSUE] {oi.get('summary', '')}")
+        open_issue_parts.append(f"- [OPEN ISSUE] {_subject_labelled_summary(oi)}")
     gaps_text = "\n".join(open_issue_parts) if open_issue_parts else "None identified."
 
     strategy_text = strategies[-1].content if strategies else "Structure professionally."

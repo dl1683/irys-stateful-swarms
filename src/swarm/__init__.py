@@ -196,6 +196,9 @@ def run_swarm(task: Task, caller: ModelCaller, *,
     entries, tokens = _execute_initial_reading(blackboard, task, caller, seed_plan, domain_lens)
     blackboard.add_entries_batch(entries)
     blackboard.add_tokens(tokens)
+    blackboard.entity_overview_state["direct_source_entry_ids"] = [
+        entry.id for entry in entries if entry.source and entry.source.document
+    ]
     try:
         _, name_tokens = discover_pending_names(blackboard.entity_overview_state, entries, caller)
         blackboard.add_tokens_from_last_call(name_tokens)
@@ -424,8 +427,14 @@ def run_swarm(task: Task, caller: ModelCaller, *,
             overview = next((entry for entry in output.entries if entry.type == "entity_overview"), None)
             if overview:
                 for group_id in entity_ids:
+                    previous_record = blackboard.entity_overview_state.setdefault("overviews", {}).get(group_id, {})
+                    superseded_ids = list(previous_record.get("superseded_entry_ids", []))
+                    previous_id = previous_record.get("entry_id", "")
+                    if previous_id and previous_id != overview.id:
+                        superseded_ids.append(previous_id)
                     blackboard.entity_overview_state.setdefault("overviews", {})[group_id] = {
                         "entry_id": overview.id,
+                        "superseded_entry_ids": list(dict.fromkeys(superseded_ids)),
                         "input_ids": output.task.get("entity_input_ids", []),
                         "structured": output.task.get("entity_structured_overview", {}),
                         "source_states": {
@@ -469,6 +478,8 @@ def run_swarm(task: Task, caller: ModelCaller, *,
             if entry.type != "entity_overview"
         ]
         if direct_entries:
+            direct_ids = blackboard.entity_overview_state.setdefault("direct_source_entry_ids", [])
+            direct_ids[:] = list(dict.fromkeys(direct_ids + [entry.id for entry in direct_entries]))
             try:
                 _, name_tokens = discover_pending_names(
                     blackboard.entity_overview_state, direct_entries, iter_caller,

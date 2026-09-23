@@ -4,10 +4,10 @@ from src.swarm.blackboard import Blackboard
 from src.swarm.entity_overview import (
     NameCatalogue, attach_relevant_overviews, automatic_overview_tasks, overview_inventory,
     defer_overview_dependent_tasks, entry_state, parse_discovered_names, prepare_overview_tasks,
-    run_entity_overview,
+    resolve_overview_request, run_entity_overview,
     discover_pending_names,
 )
-from src.swarm.models import Entry, EntrySource, ModelResult
+from src.swarm.models import Entry, EntrySource, ModelResult, WorkerRecord
 from src.swarm.orchestrator import run_orchestrator
 from src.swarm.worker_dispatch import execute_workers_parallel, parse_worker_output
 
@@ -427,3 +427,90 @@ def test_refresh_uses_changed_source_state_without_derived_trigger_and_keeps_old
                         iteration=3, previous_state=state["overviews"]["crestmoor trading"]["structured"])
     assert "REFRESH: Previous structured state follows" in caller.prompts[0]
     assert "Old address statement" in caller.prompts[0]
+
+
+def test_refresh_selection_prioritizes_changed_and_new_evidence_then_oldest_waiter():
+    names = ["Changed Co", "Busy Co", "Fresh Co", "Old Co", "Derived Co"]
+    state = {"variants": {name.casefold(): [name] for name in names}, "overviews": {}}
+    entries = []
+    for name in names:
+        key = name.casefold()
+        base = Entry(
+            id=f"{key}-base", content=f"{name} original fact.",
+            source=EntrySource(f"{key}-base.pdf", "s"),
+        )
+        entries.append(base)
+        state["overviews"][key] = {
+            "entry_id": f"overview-{key}", "input_ids": [base.id],
+            "source_states": {base.id: entry_state(base)},
+            "last_success_iteration": {"old co": 0, "busy co": 3}.get(key, 4),
+        }
+
+    changed = next(entry for entry in entries if entry.id == "changed co-base")
+    changed.content = "Changed Co corrected fact."
+    for name, count in (("Busy Co", 4), ("Fresh Co", 5), ("Old Co", 4)):
+        for index in range(count):
+            entries.append(Entry(
+                id=f"{name.casefold()}-new-{index}", content=f"{name} direct fact {index}.",
+                source=EntrySource(f"{name.casefold()}-{index}.pdf", "s"),
+                created_by=WorkerRecord(f"worker-{index % 2}", "direct read", 5),
+            ))
+    entries.extend(Entry(
+        id=f"derived-{index}", type="analysis", content=f"Derived Co repeated analysis {index}.",
+        source=EntrySource(f"derived-{index}.pdf", "s"),
+        created_by=WorkerRecord(f"analysis-{index}", "derived work", 5),
+    ) for index in range(4))
+
+    inventory = overview_inventory(state, entries, iteration=6)
+    by_id = {item["entity_id"]: item for item in inventory}
+    assert by_id["derived co"]["new_card_count"] == 0
+    assert by_id["derived co"]["suggestion"] == ""
+    assert by_id["fresh co"]["new_worker_count"] == 2
+
+    tasks = automatic_overview_tasks(inventory, state, iteration=6)
+    assert [task["entity_overview_id"] for task in tasks] == ["changed co", "fresh co", "old co"]
+    assert [task["overview_selection_reason"] for task in tasks] == [
+        "changed or inactive support", "new direct evidence", "oldest eligible overview",
+    ]
+
+
+def test_overview_request_resolves_current_old_and_unambiguous_name_but_rejects_ambiguity():
+    inventory = [
+        {"entity_id": "petrov", "variants": ["Alexei Petrov", "A. Petrov"]},
+        {"entity_id": "other petrov", "variants": ["A. Petrov"]},
+    ]
+    state = {"overviews": {"petrov": {
+        "entry_id": "overview-current", "superseded_entry_ids": ["overview-old"],
+    }}}
+
+    assert resolve_overview_request("petrov", inventory, state) == ("petrov", "")
+    assert resolve_overview_request("overview-current", inventory, state) == ("petrov", "")
+    assert resolve_overview_request("overview-old", inventory, state) == ("petrov", "")
+    assert resolve_overview_request("Alexei Petrov", inventory, state) == ("petrov", "")
+    assert resolve_overview_request("A. Petrov", inventory, state) == ("", "ambiguous overview identifier")
+
+
+def test_refresh_slots_count_a_shared_overview_only_once():
+    inventory = [
+        {"entity_id": "a", "variants": ["A"], "source_card_ids": ["a1"] * 6,
+         "overview_id": "shared", "new_card_count": 6, "new_worker_count": 2,
+         "changed_source_ids": [], "inactive_support_ids": [], "last_success_iteration": 4,
+         "suggestion": "refresh"},
+        {"entity_id": "a alias", "variants": ["A Alias"], "source_card_ids": ["a2"] * 5,
+         "overview_id": "shared", "new_card_count": 5, "new_worker_count": 2,
+         "changed_source_ids": [], "inactive_support_ids": [], "last_success_iteration": 4,
+         "suggestion": "refresh"},
+        {"entity_id": "b", "variants": ["B"], "source_card_ids": ["b1"] * 4,
+         "overview_id": "b-overview", "new_card_count": 4, "new_worker_count": 1,
+         "changed_source_ids": [], "inactive_support_ids": [], "last_success_iteration": 3,
+         "suggestion": "refresh"},
+        {"entity_id": "c", "variants": ["C"], "source_card_ids": ["c1"] * 4,
+         "overview_id": "c-overview", "new_card_count": 4, "new_worker_count": 1,
+         "changed_source_ids": [], "inactive_support_ids": [], "last_success_iteration": 0,
+         "suggestion": "refresh"},
+    ]
+
+    tasks = automatic_overview_tasks(inventory, {}, iteration=6)
+
+    assert [task["entity_overview_id"] for task in tasks] == ["a", "b", "c"]
+    assert tasks[0]["entity_overview_group_ids"] == ["a", "a alias"]
