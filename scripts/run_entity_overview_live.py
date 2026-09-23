@@ -10,6 +10,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+# This runner is intentionally finite, including provider-level transient retries.
+os.environ.setdefault("GEMINI_MAX_REQUESTS", "4")
+
 from src.ingestion import ingest_file
 from src.swarm.blackboard import Blackboard
 from src.swarm.entity_overview import (
@@ -37,9 +40,17 @@ class RecordingCaller:
         self.calls: list[dict] = []
 
     def complete(self, prompt, *, max_tokens=8192, temperature=0.05, json_mode=True):
-        result = self.caller.complete(
-            prompt, max_tokens=max_tokens, temperature=temperature, json_mode=json_mode,
-        )
+        try:
+            result = self.caller.complete(
+                prompt, max_tokens=max_tokens, temperature=temperature, json_mode=json_mode,
+            )
+        except Exception as exc:
+            self.calls.append({
+                "prompt": prompt, "error": str(exc),
+                "requested_output_tokens": max_tokens,
+                "provider_requests_total": getattr(self.caller, "provider_request_count", None),
+            })
+            raise
         self.calls.append({
             "prompt": prompt,
             "response": result.text,
@@ -48,6 +59,7 @@ class RecordingCaller:
             "tokens_total": result.tokens_total,
             "model": result.model,
             "provider_attempts": result.provider_attempts,
+            "provider_requests_total": getattr(self.caller, "provider_request_count", None),
         })
         return result
 
@@ -178,9 +190,20 @@ def _run_freshness_checkpoint(args, caller: RecordingCaller | None) -> dict:
         task_instruction="Extract current personal residency and sanctions-screening distinctions.",
         entries=cards, iteration=iteration, entity_overview_state=state,
     )
-    outputs = execute_workers_parallel(overview_tasks, board, caller)
-    if len(outputs) != 2 or any(not output.entries for output in outputs):
-        raise ValueError("both bounded personal overview refreshes must succeed")
+    # Sequential calls make provider failures attributable and keep the hard cap auditable.
+    outputs = [execute_workers_parallel([task], board, caller)[0] for task in overview_tasks]
+    failures = [
+        {"entity_id": output.task.get("entity_overview_id"),
+         "error": output.task.get("entity_error", "no usable overview")}
+        for output in outputs if not output.entries
+    ]
+    if failures:
+        report.update({
+            "error": "one or more bounded personal overview refreshes failed",
+            "refresh_failures": failures, "calls": caller.calls,
+            "provider_requests_total": getattr(caller.caller, "provider_request_count", None),
+        })
+        return report
     for output in outputs:
         board.add_entries_batch(output.entries)
         entity_id = output.task["entity_overview_id"]
@@ -217,6 +240,7 @@ LABELLED PACKET ROWS:
         "downstream_entries": [e.to_dict() for e in worker.entries],
         "packet": packet, "draft": draft_payload.get("text", ""),
         "draft_tokens": draft_tokens, "calls": caller.calls,
+        "provider_requests_total": getattr(caller.caller, "provider_request_count", None),
     })
     return report
 
@@ -275,6 +299,8 @@ def main() -> None:
             (args.output / "entity_overview_freshness.json").write_text(
                 json.dumps(report, indent=2), encoding="utf-8",
             )
+        if report.get("error"):
+            raise RuntimeError(report["error"])
         print(json.dumps({
             "saved": str(args.output / "entity_overview_freshness.json"),
             "calls": len(report["calls"]),

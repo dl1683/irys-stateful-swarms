@@ -70,6 +70,11 @@ class GeminiCaller:
         )
         self.model = model
 
+    @property
+    def provider_request_count(self) -> int:
+        """Expose this process's request count for bounded live experiments."""
+        return _GEMINI_LIMITER.request_count
+
     def _generate_content_with_timeout(
         self,
         prompt: str,
