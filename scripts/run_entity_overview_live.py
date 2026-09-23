@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.ingestion import ingest_file
+from src.swarm import _run_final_overview_pass
 from src.swarm.blackboard import Blackboard
 from src.swarm.entity_overview import (
     NameCatalogue,
@@ -246,6 +247,61 @@ LABELLED PACKET ROWS:
     return report
 
 
+def _run_final_freshness_checkpoint(args, caller: RecordingCaller | None) -> dict:
+    """Replay one late source finding through the real final pass, below routine threshold."""
+    saved = json.loads(args.blackboard.read_text(encoding="utf-8"))
+    by_id = {raw["id"]: raw for raw in saved["entries"]}
+    entity_id, late_id = "nikolai v petrov", "e392"
+    saved_state = saved["entity_overview_state"]
+    prior = saved_state["overviews"][entity_id]
+    selected_ids = list(dict.fromkeys(prior["input_ids"] + [late_id, prior["entry_id"]]))
+    entries = [_saved_entry(by_id[entry_id]) for entry_id in selected_ids]
+    state = {
+        "variants": {entity_id: saved_state["variants"][entity_id]},
+        "overviews": {entity_id: json.loads(json.dumps(prior))},
+        # This historical direct read predates the explicit direct-source ledger.
+        "direct_source_entry_ids": [late_id], "pending": [], "failed": [],
+    }
+    iteration = int(saved["iteration"])
+    before = overview_inventory(state, entries, iteration)
+    if len(before) != 1 or before[0]["new_card_count"] != 1 or before[0]["suggestion"]:
+        raise ValueError("late-source fixture is not a single below-threshold update")
+    report = {
+        "model": args.model, "snapshot": str(args.blackboard),
+        "historical_snapshot_immutable": True, "entity_id": entity_id,
+        "late_source_id": late_id, "fixture_card_ids": selected_ids,
+        "inventory_before": before, "dry_run": args.dry_run, "calls": [],
+    }
+    if args.dry_run:
+        return report
+    board = Blackboard(
+        task_instruction="Report current personal residency and screening distinctions.",
+        entries=entries, iteration=iteration, entity_overview_state=state,
+    )
+    _run_final_overview_pass(board, caller)
+    packet = build_synthesis_packet(project_overview_statements(board), board)
+    new_id = board.entity_overview_state["overviews"][entity_id]["entry_id"]
+    subject_rows = [row for row in packet if late_id in row["entry_ids"]
+                    and "petrov" in str(row.get("overview_group_label", "")).casefold()]
+    candidate_rows = [row for row in packet if "candidate" in
+                      str(row.get("overview_group_label", "")).casefold()]
+    report.update({
+        "inventory_after": overview_inventory(board.entity_overview_state, board.entries, iteration),
+        "final_candidates": state.get("final_candidates", []),
+        "final_attempted": state.get("final_attempted", []),
+        "freshness_failures": state.get("freshness_failures", []),
+        "prior_overview_id": prior["entry_id"], "current_overview_id": new_id,
+        "overview_outputs": [entry.to_dict() for entry in board.entries
+                             if entry.type == "entity_overview" and entry.id == new_id],
+        "packet": packet, "subject_rows_from_late_source": subject_rows,
+        "candidate_rows": candidate_rows, "calls": caller.calls,
+        "provider_requests_total": getattr(caller.caller, "provider_request_count", None),
+    })
+    if new_id == prior["entry_id"] or not subject_rows or not candidate_rows:
+        report["error"] = "final pass did not publish a labelled subject fact and separate candidate"
+    return report
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--task-dir", type=Path)
@@ -264,15 +320,19 @@ def main() -> None:
                         help="Prior live artifact; makes one refresh call and skips downstream work.")
     parser.add_argument("--freshness-checkpoint", action="store_true",
                         help="Use saved September evidence for the bounded four-call checkpoint.")
+    parser.add_argument("--final-freshness-checkpoint", action="store_true",
+                        help="Replay one late source fact through the final pass (one model call).")
     parser.add_argument("--dry-run", action="store_true",
                         help="Resolve and save selections without making provider calls.")
     args = parser.parse_args()
 
-    if not args.freshness_checkpoint and bool(args.blackboard) != bool(args.entry_ids):
+    if args.freshness_checkpoint and args.final_freshness_checkpoint:
+        parser.error("choose only one freshness checkpoint")
+    if not (args.freshness_checkpoint or args.final_freshness_checkpoint) and bool(args.blackboard) != bool(args.entry_ids):
         parser.error("--blackboard and --entry-ids must be used together")
-    if args.freshness_checkpoint and not args.blackboard:
-        parser.error("--freshness-checkpoint requires --blackboard")
-    if not args.freshness_checkpoint and not args.blackboard and not args.task_dir:
+    if (args.freshness_checkpoint or args.final_freshness_checkpoint) and not args.blackboard:
+        parser.error("freshness checkpoints require --blackboard")
+    if not (args.freshness_checkpoint or args.final_freshness_checkpoint) and not args.blackboard and not args.task_dir:
         parser.error("--task-dir is required unless replaying --blackboard entries")
     if args.refresh_artifact and not args.blackboard:
         parser.error("--refresh-artifact requires --blackboard replay")
@@ -286,13 +346,16 @@ def main() -> None:
         parser.error("--output must be a new or empty attempt directory")
     args.output.mkdir(parents=True, exist_ok=True)
 
-    if args.freshness_checkpoint:
+    if args.freshness_checkpoint or args.final_freshness_checkpoint:
         os.environ["GEMINI_RETRY_DELAY_SECONDS"] = "20"
         from src.providers.gemini import GeminiCaller
-        caller = None if args.dry_run else RecordingCaller(GeminiCaller(model=args.model))
+        caller = None if args.dry_run else RecordingCaller(
+            GeminiCaller(model=args.model), max_calls=1 if args.final_freshness_checkpoint else 4,
+        )
         report = {}
         try:
-            report = _run_freshness_checkpoint(args, caller)
+            report = (_run_final_freshness_checkpoint(args, caller)
+                      if args.final_freshness_checkpoint else _run_freshness_checkpoint(args, caller))
         except Exception as exc:
             report = {
                 "model": args.model, "snapshot": str(args.blackboard),
@@ -309,9 +372,10 @@ def main() -> None:
         print(json.dumps({
             "saved": str(args.output / "entity_overview_freshness.json"),
             "calls": len(report["calls"]),
-            "bounded_personal_selection": [
+            "selection": (report.get("final_candidates", [item["entity_id"] for item in
+                         report.get("inventory_before", [])]) if args.final_freshness_checkpoint else [
                 task["entity_overview_id"] for task in report["bounded_personal_selection"]
-            ],
+            ]),
         }))
         return
 
