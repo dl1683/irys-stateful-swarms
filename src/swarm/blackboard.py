@@ -50,6 +50,20 @@ class Blackboard:
     output_dir: str = ""
     entity_overview_state: dict = field(default_factory=dict)
 
+    @staticmethod
+    def source_fingerprints(documents: list[DocumentStatus]) -> list[dict]:
+        """Hash original task files, preserving order even when document IDs repeat."""
+        sources = []
+        for doc in documents:
+            if doc.source_path:
+                with open(doc.source_path, "rb") as source:
+                    digest = hashlib.file_digest(source, "sha256").hexdigest()
+            else:
+                digest = hashlib.sha256(doc.text.encode("utf-8")).hexdigest()
+            sources.append({"id": doc.id, "name": doc.name,
+                            "source_path": doc.source_path, "sha256": digest})
+        return sources
+
     def save_checkpoint(self, seed_plan: dict, entries_per_iteration: list[int],
                         *, loop_ended: bool) -> Path | None:
         """Persist the complete durable state after an iteration has finished."""
@@ -59,16 +73,7 @@ class Blackboard:
             raise ValueError("checkpoint needs a completed iteration")
         directory = Path(self.output_dir) / "swarm" / "checkpoints"
         directory.mkdir(parents=True, exist_ok=True)
-        sources = []
-        for doc in self.documents:
-            if doc.source_path:
-                with open(doc.source_path, "rb") as source:
-                    digest = hashlib.file_digest(source, "sha256").hexdigest()
-            else:
-                # In-memory tasks have no original file; runner tasks always do.
-                digest = hashlib.sha256(doc.text.encode("utf-8")).hexdigest()
-            sources.append({"id": doc.id, "name": doc.name,
-                            "source_path": doc.source_path, "sha256": digest})
+        sources = self.source_fingerprints(self.documents)
         board = {
             key: getattr(self, key) for key in (
                 "task_instruction", "iteration", "total_tokens_used", "tokens_input",
@@ -81,7 +86,7 @@ class Blackboard:
                 "id", "name", "size_bytes", "source_path", "headings",
                 "structural_profile", "read_status", "sections_read", "sections_unread",
             )
-        } for doc in self.documents]
+        } | {"was_loaded": doc.is_loaded} for doc in self.documents]
         board["entries"] = [asdict(entry) for entry in self.entries]
         board["signals"] = [asdict(signal) for signal in self.signals]
         counters = id_counters()
@@ -137,9 +142,50 @@ class Blackboard:
                     or not isinstance(data["entries_per_iteration"], list)
                     or not isinstance(data["source_fingerprints"], list)):
                 raise ValueError("invalid checkpoint metadata")
+            if (len(data["entries_per_iteration"]) > 2
+                    or any(type(count) is not int or count < 0
+                           for count in data["entries_per_iteration"])
+                    or any(type(board_data[key]) is not int or board_data[key] < 0
+                           for key in ("total_tokens_used", "tokens_input",
+                                       "tokens_output", "token_budget"))
+                    or not isinstance(board_data["cost_by_model"], dict)
+                    or any(not isinstance(usage, dict)
+                           or any(type(usage.get(key)) is not int or usage[key] < 0
+                                  for key in ("input", "output", "total", "calls"))
+                           for usage in board_data["cost_by_model"].values())):
+                raise ValueError("invalid checkpoint metering")
+            counters = data["id_counters"]
+            if (not isinstance(counters, dict)
+                    or any(type(counters.get(key)) is not int or counters[key] < 0
+                           for key in ("entry", "signal"))):
+                raise ValueError("invalid checkpoint ID counters")
+            if (not isinstance(board_data["documents"], list)
+                    or not isinstance(board_data["entries"], list)
+                    or not isinstance(board_data["signals"], list)):
+                raise ValueError("invalid checkpoint collections")
+            document_fields = {"id", "name", "size_bytes", "source_path", "headings",
+                               "structural_profile", "read_status", "sections_read",
+                               "sections_unread", "was_loaded"}
+            entry_fields = {item.name for item in fields(Entry)}
+            signal_fields = {item.name for item in fields(Signal)}
+            if (any(not isinstance(doc, dict) or not document_fields <= doc.keys()
+                    or type(doc["was_loaded"]) is not bool
+                    for doc in board_data["documents"])
+                    or any(not isinstance(entry, dict)
+                           or not entry_fields <= entry.keys()
+                           for entry in board_data["entries"])
+                    or any(not isinstance(signal, dict)
+                           or not signal_fields <= signal.keys()
+                           for signal in board_data["signals"])):
+                raise ValueError("incomplete checkpoint records")
             board = cls(**{key: board_data[key] for key in board_fields
                            if key not in ("documents", "entries", "signals")})
-            board.documents = [DocumentStatus(**doc) for doc in board_data["documents"]]
+            board.documents = []
+            for doc in board_data["documents"]:
+                restored = DocumentStatus(**{key: value for key, value in doc.items()
+                                             if key != "was_loaded"})
+                restored._checkpoint_was_loaded = doc["was_loaded"]
+                board.documents.append(restored)
             board.entries = [Entry(
                 **{**entry,
                    "source": EntrySource(**entry["source"]) if entry["source"] else None,
@@ -148,7 +194,6 @@ class Blackboard:
             ) for entry in board_data["entries"]]
             board.signals = [Signal(**signal) for signal in board_data["signals"]]
             board._entry_index = {entry.id: entry for entry in board.entries if entry.id}
-            counters = data["id_counters"]
             advance_id_counters(counters["entry"], counters["signal"])
             return (board, data["seed_plan"], data["entries_per_iteration"],
                     data["loop_ended"], data["source_fingerprints"])

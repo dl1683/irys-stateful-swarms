@@ -5,6 +5,7 @@ import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .blackboard import Blackboard
 from .analysis import run_direct_analysis
@@ -304,126 +305,166 @@ def _should_use_file_scoped_synthesis(deliverables_map: dict) -> bool:
     return any(hint in filename for hint in _STRUCTURED_SINGLE_FILE_HINTS)
 
 
+def _restore_checkpoint(task: Task, path: Path) -> tuple[Blackboard, dict, list[int], bool]:
+    board, seed_plan, counts, loop_ended, saved_sources = Blackboard.load_checkpoint(path)
+    if board.task_instruction != task.instruction:
+        raise ValueError("checkpoint task instruction differs from current task")
+    # The checkpoint location anchors a relative output path across CLI working directories.
+    if Path(path).resolve().parents[2] != Path(task.output_dir).resolve():
+        raise ValueError("checkpoint output directory differs from current run")
+    board.output_dir = task.output_dir
+    fresh = _build_doc_statuses(task.documents)
+    if Blackboard.source_fingerprints(fresh) != saved_sources:
+        raise ValueError("checkpoint source files differ from current task")
+    if len(board.documents) != len(fresh):
+        raise ValueError("checkpoint document state is incomplete")
+    for saved, current in zip(board.documents, fresh):
+        if (saved.id, saved.name, saved.source_path) != (
+                current.id, current.name, current.source_path):
+            raise ValueError("checkpoint document identities differ from current task")
+        # A document read before interruption must have text and index available again.
+        if current._lazy_doc is not None and saved._checkpoint_was_loaded:
+            current.materialize()
+        saved.text = current.text
+        saved.section_index = current.section_index
+        saved._lazy_doc = current._lazy_doc
+        if hasattr(current, "structured"):
+            saved.structured = current.structured
+    return board, seed_plan, counts, loop_ended
+
+
 def run_swarm(task: Task, caller: ModelCaller, *,
               synthesis_caller: ModelCaller | None = None,
               reviewer_caller: ModelCaller | None = None,
               token_budget: int | None = None,
               max_iterations: int | None = None,
-              min_iterations: int | None = None) -> tuple[str | dict[str, str], Blackboard]:
+              min_iterations: int | None = None,
+              resume_checkpoint: Path | None = None) -> tuple[str | dict[str, str], Blackboard]:
     budget = token_budget or int(os.getenv("SWARM_TOKEN_BUDGET", "3000000"))
     max_iter = max_iterations or int(os.getenv("SWARM_MAX_ITERATIONS", "15"))
     min_iter = min_iterations or int(os.getenv("SWARM_MIN_ITERATIONS", "2"))
     synth_caller = synthesis_caller or caller
     review_caller = reviewer_caller
 
-    # Phase 1: Initialize
-    blackboard = Blackboard(
-        task_instruction=task.instruction,
-        documents=_build_doc_statuses(task.documents),
-        token_budget=budget,
-        started_at=datetime.now(timezone.utc).isoformat(),
-        output_dir=task.output_dir,
-    )
+    if resume_checkpoint is not None:
+        # Validation and source reattachment happen before any provider call.
+        blackboard, seed_plan, _entries_per_iter, loop_ended = _restore_checkpoint(
+            task, resume_checkpoint,
+        )
+        if not loop_ended and blackboard.iteration >= max_iter:
+            raise ValueError("checkpoint iteration is beyond the configured maximum")
+        start_iteration = max_iter + 1 if loop_ended else blackboard.iteration + 1
+    else:
+        blackboard = Blackboard(
+            task_instruction=task.instruction,
+            documents=_build_doc_statuses(task.documents),
+            token_budget=budget,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            output_dir=task.output_dir,
+        )
+        seed_plan = {}
+        _entries_per_iter = []
+        start_iteration = 1
 
-    # Phase 2: Structural profiling (skip unloaded docs in large corpora)
-    for doc in blackboard.documents:
-        if not doc.text:
-            continue
-        profile, tokens = _run_structural_profile(doc, task, caller)
-        doc.structural_profile = profile
-        blackboard.add_tokens_from_last_call(tokens)
+    domain_lens = {}
+    if resume_checkpoint is None:
+        # Phase 2: Structural profiling (skip unloaded docs in large corpora)
+        for doc in blackboard.documents:
+            if not doc.text:
+                continue
+            profile, tokens = _run_structural_profile(doc, task, caller)
+            doc.structural_profile = profile
+            blackboard.add_tokens_from_last_call(tokens)
 
-    # Phase 3: seed task decomposition and analytical planning
-    seed_plan = {}
-    if review_caller is not None:
-        seed_plan, seed_tokens = generate_seed(blackboard, review_caller)
-        blackboard.add_tokens_from_last_call(seed_tokens)
-        seed_to_signals(seed_plan, blackboard)
-        # Put the analytical framework on the blackboard as a strategy entry
-        framework = seed_plan.get("analytical_framework", "")
-        if framework:
-            from .models import WorkerRecord
-            blackboard.add_entry(Entry(
-                id=gen_entry_id(), type="strategy", content=framework,
-                created_by=WorkerRecord("seed_planner", "analytical_framework", 0),
-                confidence=0.9, status="active",
-            ))
-        for criterion in seed_plan.get("completeness_criteria", []):
-            if isinstance(criterion, str) and criterion.strip():
+        # Phase 3: seed task decomposition and analytical planning
+        if review_caller is not None:
+            seed_plan, seed_tokens = generate_seed(blackboard, review_caller)
+            blackboard.add_tokens_from_last_call(seed_tokens)
+            seed_to_signals(seed_plan, blackboard)
+            # Put the analytical framework on the blackboard as a strategy entry
+            framework = seed_plan.get("analytical_framework", "")
+            if framework:
+                from .models import WorkerRecord
                 blackboard.add_entry(Entry(
-                    id=gen_entry_id(), type="strategy",
-                    content=f"COMPLETENESS CRITERION: {criterion}",
-                    created_by=WorkerRecord("seed_planner", "completeness_criteria", 0),
+                    id=gen_entry_id(), type="strategy", content=framework,
+                    created_by=WorkerRecord("seed_planner", "analytical_framework", 0),
                     confidence=0.9, status="active",
                 ))
-        blackboard.save_snapshot("seed")
+            for criterion in seed_plan.get("completeness_criteria", []):
+                if isinstance(criterion, str) and criterion.strip():
+                    blackboard.add_entry(Entry(
+                        id=gen_entry_id(), type="strategy",
+                        content=f"COMPLETENESS CRITERION: {criterion}",
+                        created_by=WorkerRecord("seed_planner", "completeness_criteria", 0),
+                        confidence=0.9, status="active",
+                    ))
+            blackboard.save_snapshot("seed")
 
-    # Phase 3a: Domain Lens — DISABLED (W12: unclear value, adds tokens without
-    # measurable improvement; seed plan + extraction depth check are sufficient)
-    domain_lens = {}
+        # Phase 3a: Domain Lens — DISABLED (W12: unclear value, adds tokens without
+        # measurable improvement; seed plan + extraction depth check are sufficient)
 
-    # Phase 3b: If no documents but web search is enabled, add a research signal
-    from .web_search import web_search_enabled
-    if not blackboard.documents and web_search_enabled():
-        from .models import Signal, gen_signal_id
-        blackboard.add_signal(Signal(
-            id=gen_signal_id(), type="question",
-            content=(
-                "No source documents provided. Use web search to find "
-                "information needed to answer the task. Break the question "
-                "into specific search queries."
-            ),
-            origin_entry="bootstrap", priority="critical",
-            status="open", iteration_created=0,
-        ))
-
-    # Phase 4: Initial reading (parallel per section)
-    entries, tokens = _execute_initial_reading(blackboard, task, caller, seed_plan, domain_lens)
-    blackboard.add_entries_batch(entries)
-    blackboard.add_tokens(tokens)
-    blackboard.entity_overview_state["direct_source_entry_ids"] = [
-        entry.id for entry in entries if entry.source and entry.source.document
-    ]
-    try:
-        _, name_tokens = discover_pending_names(blackboard.entity_overview_state, entries, caller)
-        blackboard.add_tokens_from_last_call(name_tokens)
-        if name_tokens:
-            usage = blackboard.entity_overview_state.setdefault("usage", {})
-            usage["name_discovery_tokens"] = usage.get("name_discovery_tokens", 0) + name_tokens
-            usage["name_discovery_calls"] = usage.get("name_discovery_calls", 0) + 1
-    except (ValueError, RuntimeError) as error:
-        # Keep unprocessed cards pending; later eligible direct work can retry discovery.
-        _record_entity_discovery_failure(blackboard.entity_overview_state, 0, error)
-
-    # Phase 4: Extraction depth check — auto re-extract under-covered documents
-    for doc in blackboard.documents:
-        if not doc.structural_profile:
-            continue
-        expected = doc.structural_profile.get("numbered_items", 0)
-        if not isinstance(expected, (int, float)) or expected <= 0:
-            continue
-        actual = len([
-            e for e in blackboard.entries
-            if e.source and e.source.document == doc.name
-            and e.status == "active"
-            and e.type in ("observation", "analysis", "calculation")
-        ])
-        if actual < expected * 0.5:
+        # Phase 3b: If no documents but web search is enabled, add a research signal
+        from .web_search import web_search_enabled
+        if not blackboard.documents and web_search_enabled():
             from .models import Signal, gen_signal_id
             blackboard.add_signal(Signal(
-                id=gen_signal_id(), type="convergence_gap",
+                id=gen_signal_id(), type="question",
                 content=(
-                    f"Document '{doc.name}' has ~{int(expected)} enumerable items "
-                    f"but only {actual} extracted. Need targeted re-extraction."
+                    "No source documents provided. Use web search to find "
+                    "information needed to answer the task. Break the question "
+                    "into specific search queries."
                 ),
-                origin_entry="extraction_depth_check", priority="critical",
+                origin_entry="bootstrap", priority="critical",
                 status="open", iteration_created=0,
             ))
 
-    # Phase 5: Prioritize initial signals
-    unp = [s for s in blackboard.signals if s.status == "open"]
-    if unp:
-        blackboard.add_tokens(prioritize_signals(blackboard, unp, review_caller or caller))
+        # Phase 4: Initial reading (parallel per section)
+        entries, tokens = _execute_initial_reading(blackboard, task, caller, seed_plan, domain_lens)
+        blackboard.add_entries_batch(entries)
+        blackboard.add_tokens(tokens)
+        blackboard.entity_overview_state["direct_source_entry_ids"] = [
+            entry.id for entry in entries if entry.source and entry.source.document
+        ]
+        try:
+            _, name_tokens = discover_pending_names(blackboard.entity_overview_state, entries, caller)
+            blackboard.add_tokens_from_last_call(name_tokens)
+            if name_tokens:
+                usage = blackboard.entity_overview_state.setdefault("usage", {})
+                usage["name_discovery_tokens"] = usage.get("name_discovery_tokens", 0) + name_tokens
+                usage["name_discovery_calls"] = usage.get("name_discovery_calls", 0) + 1
+        except (ValueError, RuntimeError) as error:
+            # Keep unprocessed cards pending; later eligible direct work can retry discovery.
+            _record_entity_discovery_failure(blackboard.entity_overview_state, 0, error)
+
+        # Phase 4: Extraction depth check — auto re-extract under-covered documents
+        for doc in blackboard.documents:
+            if not doc.structural_profile:
+                continue
+            expected = doc.structural_profile.get("numbered_items", 0)
+            if not isinstance(expected, (int, float)) or expected <= 0:
+                continue
+            actual = len([
+                e for e in blackboard.entries
+                if e.source and e.source.document == doc.name
+                and e.status == "active"
+                and e.type in ("observation", "analysis", "calculation")
+            ])
+            if actual < expected * 0.5:
+                from .models import Signal, gen_signal_id
+                blackboard.add_signal(Signal(
+                    id=gen_signal_id(), type="convergence_gap",
+                    content=(
+                        f"Document '{doc.name}' has ~{int(expected)} enumerable items "
+                        f"but only {actual} extracted. Need targeted re-extraction."
+                    ),
+                    origin_entry="extraction_depth_check", priority="critical",
+                    status="open", iteration_created=0,
+                ))
+
+        # Phase 5: Prioritize initial signals
+        unp = [s for s in blackboard.signals if s.status == "open"]
+        if unp:
+            blackboard.add_tokens(prioritize_signals(blackboard, unp, review_caller or caller))
 
     # Phase 6: Swarm loop
     # W13 revert: flash-lite (caller) for orchestrator+workers. W12 showed
@@ -437,10 +478,7 @@ def run_swarm(task: Task, caller: ModelCaller, *,
         from ..providers.anthropic import AnthropicCaller
         _premium_caller = AnthropicCaller(model=_premium_caller_env)
 
-    _entries_per_iter: list[int] = []
-    _has_docs = bool(blackboard.documents)
-
-    for iteration in range(1, max_iter + 1):
+    for iteration in range(start_iteration, max_iter + 1):
         blackboard.iteration = iteration
         blackboard.expire_old_signals()
         if iteration == 1 or iteration % 4 == 0:
@@ -983,7 +1021,8 @@ def _build_doc_statuses(documents: list[Document]) -> list[DocumentStatus]:
     statuses = []
     large_corpus = len(documents) > PROFILE_THRESHOLD
     for doc in documents:
-        src_path = doc.metadata.get("path", "")
+        raw_path = doc.metadata.get("path", "")
+        src_path = str(Path(raw_path).resolve()) if raw_path else ""
         if large_corpus and doc._loader is not None:
             statuses.append(DocumentStatus(
                 id=doc.id, name=doc.name, size_bytes=doc.size_bytes,
