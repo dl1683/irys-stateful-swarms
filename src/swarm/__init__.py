@@ -497,6 +497,8 @@ def run_swarm(task: Task, caller: ModelCaller, *,
             blackboard.add_tokens_from_last_call(conv_tokens)
             if converged:
                 blackboard.save_snapshot("converged")
+                blackboard.save_snapshot(f"post_{iteration}")
+                blackboard.save_checkpoint(seed_plan, _entries_per_iter, loop_ended=True)
                 break
             _reject = "Convergence rejected. Address the gaps identified."
             if analysis_mode_override:
@@ -510,6 +512,8 @@ def run_swarm(task: Task, caller: ModelCaller, *,
                 blackboard.add_tokens_from_last_call(t2)
                 if converged2:
                     blackboard.save_snapshot("converged_retry")
+                    blackboard.save_snapshot(f"post_{iteration}")
+                    blackboard.save_checkpoint(seed_plan, _entries_per_iter, loop_ended=True)
                     break
                 _force = "You MUST produce workers. Do NOT converge. Find remaining gaps."
                 if analysis_mode_override:
@@ -522,6 +526,9 @@ def run_swarm(task: Task, caller: ModelCaller, *,
         tasks_list = _prepare_entity_work(blackboard, orch.get("workers", []), iteration, inventory)
         if not tasks_list:
             _entries_per_iter.append(0)
+            blackboard.save_snapshot(f"post_{iteration}")
+            blackboard.save_checkpoint(seed_plan, _entries_per_iter,
+                                       loop_ended=iteration == max_iter)
             continue
 
         if analysis_mode_override:
@@ -557,6 +564,9 @@ def run_swarm(task: Task, caller: ModelCaller, *,
 
         if not tasks_list:
             _entries_per_iter.append(0)
+            blackboard.save_snapshot(f"post_{iteration}")
+            blackboard.save_checkpoint(seed_plan, _entries_per_iter,
+                                       loop_ended=iteration == max_iter)
             continue
 
         outputs = execute_workers_parallel(tasks_list, blackboard, iter_caller)
@@ -572,10 +582,13 @@ def run_swarm(task: Task, caller: ModelCaller, *,
 
         if blackboard.budget_used_pct() >= 85:
             blackboard.save_snapshot("budget_exhausted")
+            blackboard.save_snapshot(f"post_{iteration}")
+            blackboard.save_checkpoint(seed_plan, _entries_per_iter, loop_ended=True)
             break
 
-        if iteration == 1 or iteration % 4 == 0 or iteration == max_iter:
-            blackboard.save_snapshot(f"post_{iteration}")
+        blackboard.save_snapshot(f"post_{iteration}")
+        blackboard.save_checkpoint(seed_plan, _entries_per_iter,
+                                   loop_ended=iteration == max_iter)
 
     # Phase after extraction: direct analysis
     if review_caller is not None:

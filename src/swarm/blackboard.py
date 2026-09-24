@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 import re
-from dataclasses import dataclass, field
+import tempfile
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 from .models import (
-    DocumentStatus, Entry, Signal, WorkerRecord,
-    gen_entry_id, gen_signal_id,
+    DocumentStatus, Entry, EntrySource, EpistemicStatus, Signal, WorkerRecord,
+    advance_id_counters, gen_entry_id, gen_signal_id, id_counters,
 )
 
 
@@ -46,6 +49,111 @@ class Blackboard:
     started_at: str = ""
     output_dir: str = ""
     entity_overview_state: dict = field(default_factory=dict)
+
+    def save_checkpoint(self, seed_plan: dict, entries_per_iteration: list[int],
+                        *, loop_ended: bool) -> Path | None:
+        """Persist the complete durable state after an iteration has finished."""
+        if not self.output_dir:
+            return None
+        if self.iteration < 1:
+            raise ValueError("checkpoint needs a completed iteration")
+        directory = Path(self.output_dir) / "swarm" / "checkpoints"
+        directory.mkdir(parents=True, exist_ok=True)
+        sources = []
+        for doc in self.documents:
+            if doc.source_path:
+                with open(doc.source_path, "rb") as source:
+                    digest = hashlib.file_digest(source, "sha256").hexdigest()
+            else:
+                # In-memory tasks have no original file; runner tasks always do.
+                digest = hashlib.sha256(doc.text.encode("utf-8")).hexdigest()
+            sources.append({"id": doc.id, "name": doc.name,
+                            "source_path": doc.source_path, "sha256": digest})
+        board = {
+            key: getattr(self, key) for key in (
+                "task_instruction", "iteration", "total_tokens_used", "tokens_input",
+                "tokens_output", "cost_by_model", "token_budget", "started_at",
+                "output_dir", "entity_overview_state",
+            )
+        }
+        board["documents"] = [{
+            key: getattr(doc, key) for key in (
+                "id", "name", "size_bytes", "source_path", "headings",
+                "structural_profile", "read_status", "sections_read", "sections_unread",
+            )
+        } for doc in self.documents]
+        board["entries"] = [asdict(entry) for entry in self.entries]
+        board["signals"] = [asdict(signal) for signal in self.signals]
+        counters = id_counters()
+        for kind, items in (("entry", self.entries), ("signal", self.signals)):
+            prefix = "e" if kind == "entry" else "s"
+            counters[kind] = max(counters[kind], *(
+                int(item.id[1:]) for item in items
+                if item.id.startswith(prefix) and item.id[1:].isdigit()
+            ), 0)
+        payload = {
+            "schema_version": 1, "completed_iteration": self.iteration,
+            "loop_ended": loop_ended, "seed_plan": seed_plan,
+            "entries_per_iteration": entries_per_iteration[-2:],
+            "source_fingerprints": sources, "id_counters": counters,
+            "blackboard": board,
+        }
+        path = directory / f"checkpoint_iter_{self.iteration}.json"
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directory,
+                                             prefix=".checkpoint_", delete=False) as stream:
+                temporary = Path(stream.name)
+                json.dump(payload, stream, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        return path
+
+    @classmethod
+    def load_checkpoint(cls, path: Path) -> tuple[Blackboard, dict, list[int], bool, dict]:
+        """Read a complete v1 checkpoint; document text is reattached by the runner."""
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            required = {"schema_version", "completed_iteration", "loop_ended",
+                        "seed_plan", "entries_per_iteration", "source_fingerprints",
+                        "id_counters", "blackboard"}
+            if not isinstance(data, dict) or not required <= data.keys():
+                raise ValueError("incomplete checkpoint")
+            if type(data["schema_version"]) is not int or data["schema_version"] != 1:
+                raise ValueError("unsupported checkpoint version")
+            board_data = data["blackboard"]
+            board_fields = {item.name for item in fields(cls)}
+            if not isinstance(board_data, dict) or not board_fields <= board_data.keys():
+                raise ValueError("incomplete blackboard state")
+            if (type(data["completed_iteration"]) is not int
+                    or data["completed_iteration"] < 1
+                    or board_data["iteration"] != data["completed_iteration"]
+                    or type(data["loop_ended"]) is not bool
+                    or not isinstance(data["seed_plan"], dict)
+                    or not isinstance(data["entries_per_iteration"], list)
+                    or not isinstance(data["source_fingerprints"], list)):
+                raise ValueError("invalid checkpoint metadata")
+            board = cls(**{key: board_data[key] for key in board_fields
+                           if key not in ("documents", "entries", "signals")})
+            board.documents = [DocumentStatus(**doc) for doc in board_data["documents"]]
+            board.entries = [Entry(
+                **{**entry,
+                   "source": EntrySource(**entry["source"]) if entry["source"] else None,
+                   "epistemic": EpistemicStatus(**entry["epistemic"]) if entry["epistemic"] else None,
+                   "created_by": WorkerRecord(**entry["created_by"])}
+            ) for entry in board_data["entries"]]
+            board.signals = [Signal(**signal) for signal in board_data["signals"]]
+            board._entry_index = {entry.id: entry for entry in board.entries if entry.id}
+            counters = data["id_counters"]
+            advance_id_counters(counters["entry"], counters["signal"])
+            return (board, data["seed_plan"], data["entries_per_iteration"],
+                    data["loop_ended"], data["source_fingerprints"])
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, AttributeError) as error:
+            raise ValueError(f"invalid checkpoint: {error}") from error
 
     def add_tokens_from_last_call(self, tokens: int) -> None:
         """Add tokens and grab model info from the last call_model invocation."""
