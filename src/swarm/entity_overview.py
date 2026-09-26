@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from copy import deepcopy
 from hashlib import sha256
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -316,8 +317,14 @@ def resolve_overview_request(requested: object, inventory: list[dict], state: di
 
     id_matches = []
     for entity_id, record in state.get("overviews", {}).items():
-        known_ids = {record.get("entry_id", ""), *record.get("superseded_entry_ids", [])}
+        known_ids = {record.get("entry_id", ""), *record.get("superseded_entry_ids", []),
+                     *record.get("card_ids", [])}
         if value in known_ids:
+            card = next((card for card in record.get("cards", []) if card["id"] == value), None)
+            target = card.get("redirect_to") if card else None
+            if target:
+                entity_id = next((key for key, other in state.get("overviews", {}).items()
+                                  if any(c["id"] == target for c in other.get("cards", []))), entity_id)
             id_matches.append(entity_id)
     if len(id_matches) == 1:
         return id_matches[0], ""
@@ -343,6 +350,8 @@ def attach_relevant_overviews(tasks: list[dict], entries: list[Entry], state: di
         if entry.type == "entity_overview" and entry.status == "active"
     }
     records = state.get("overviews", {})
+    redirects = {card["id"]: card["redirect_to"] for record in records.values()
+                 for card in record.get("cards", []) if card.get("redirect_to")}
     stale_ids = {
         card_id for record in records.values() for card_id in record.get("card_ids", [record.get("entry_id", "")])
         if any(
@@ -355,7 +364,8 @@ def attach_relevant_overviews(tasks: list[dict], entries: list[Entry], state: di
     for task in tasks:
         if task.get("expected_output_type") == "entity_overview":
             continue
-        existing = list(dict.fromkeys(entry_id for entry_id in task.get("reads_from_blackboard", [])
+        existing = list(dict.fromkeys(redirects.get(entry_id, entry_id)
+                                      for entry_id in task.get("reads_from_blackboard", [])
                                       if entry_id not in stale_ids))
         task["reads_from_blackboard"] = existing
         selected = set(existing)
@@ -364,6 +374,8 @@ def attach_relevant_overviews(tasks: list[dict], entries: list[Entry], state: di
         candidates = []
         for entity_id, record in records.items():
             for card in record.get("cards", []):
+                if card.get("redirect_to"):
+                    continue
                 overview_id = card["id"]
                 overlap = selected & set(card["identity_source_ids"])
                 if overview_id in active_overviews and overview_id not in stale_ids and overlap:
@@ -503,6 +515,9 @@ def render_pointer_card(card: dict) -> str:
                  for fact in card["facts"])
     if card["candidate_source_ids"]:
         lines.append("Unassigned candidate pointers: " + ", ".join(card["candidate_source_ids"]))
+    for pointer in card.get("possibly_same_as", []):
+        label = "Reviewed as distinct from" if pointer["status"] == "distinct" else "Possibly same as"
+        lines.append(f"{label} {pointer['overview_id']} (supports: {', '.join(pointer['source_ids'])}; {pointer['status']})")
     return "\n".join(lines)
 
 
@@ -523,6 +538,17 @@ def sync_overview_references(state: dict, entries: list[Entry],
                 record["cards"][index] = seen_cards[card["id"]]
                 continue
             seen_cards[card["id"]] = card
+            if card.get("redirect_to"):
+                entry = by_id.get(card["id"])
+                if entry:
+                    entry.status = "inactive"
+                continue
+            if card.get("merged_from") or card.get("split_from"):
+                # A confirmed redirect can point across retrieval groups.
+                current = list(dict.fromkeys(current + [i for i in card["identity_source_ids"]
+                    + card["candidate_source_ids"]
+                    if i in by_id and by_id[i].status == "active" and by_id[i].source
+                    and by_id[i].source.document in registered_docs]))
             known = set(card["identity_source_ids"]) | set(card["candidate_source_ids"])
             # New retrieved cards stay candidates until a delta cites them for this identity.
             card["candidate_source_ids"] = [i for i in dict.fromkeys(
@@ -660,6 +686,8 @@ def select_delta_tasks(state: dict, inventory: list[dict], entries: list[Entry])
         group_id = item["entity_id"]
         record = state.get("overviews", {}).get(group_id, {})
         for card in record.get("cards", []):
+            if card.get("redirect_to"):
+                continue
             if card["id"] in seen_cards:
                 continue
             seen_cards.add(card["id"])
@@ -688,6 +716,209 @@ def select_delta_tasks(state: dict, inventory: list[dict], entries: list[Entry])
     candidates.sort(key=lambda item: item[:4])
     state["delta_backlog"] = [item[3] for item in candidates[3:]]
     return [item[4] for item in candidates[:3]]
+
+
+def identity_cards(state: dict) -> dict[str, dict]:
+    """One current card per ID even when retrieval groups share a result."""
+    return {card["id"]: card for record in state.get("overviews", {}).values()
+            for card in record.get("cards", []) if not card.get("redirect_to")}
+
+
+def _clue_matches(left: dict, right: dict) -> list[tuple[dict, dict]]:
+    matches = []
+    for first in left.get("identity_clues", []):
+        for second in right.get("identity_clues", []):
+            if (first["type"].casefold() == second["type"].casefold()
+                    and normalize_name(first["value"]) == normalize_name(second["value"])
+                    and set(first["source_ids"]) <= set(left["identity_source_ids"])
+                    and set(second["source_ids"]) <= set(right["identity_source_ids"])
+                    and set(first["source_ids"]) - set(second["source_ids"])
+                    and set(second["source_ids"]) - set(first["source_ids"])):
+                matches.append((first, second))
+    return matches
+
+
+def select_identity_reviews(state: dict, entries: list[Entry]) -> list[dict]:
+    """Propose only source-backed pairs or a worker-named ambiguity."""
+    cards = identity_cards(state)
+    active = {e.id: e for e in entries if e.status == "active" and e.type != "entity_overview"}
+    requests = state.get("identity_review_requests", [])
+    reviews = state.setdefault("identity_reviews", {})
+    proposals = []
+    ids = list(cards)
+    for index, first_id in enumerate(ids):
+        first = cards[first_id]
+        for second_id in ids[index + 1:]:
+            second = cards[second_id]
+            if not first.get("identity_source_ids") or not second.get("identity_source_ids"):
+                continue
+            pair = sorted((first_id, second_id))
+            key = "|".join(pair)
+            matches = _clue_matches(first, second)
+            clue_types = {a["type"].casefold() for a, _ in matches}
+            similar = SequenceMatcher(None, normalize_name(first["name"]),
+                                      normalize_name(second["name"])).ratio() >= 0.92
+            flags = [r for r in requests if r.get("overview_id") in pair and (
+                (second_id if r["overview_id"] == first_id else first_id) in r.get("reason", "")
+                or normalize_name(second["name"] if r["overview_id"] == first_id else first["name"])
+                in normalize_name(r.get("reason", ""))
+                or similar)]
+            if not (similar and len(clue_types) >= 2 or flags):
+                continue
+            source_ids = list(dict.fromkeys(first["identity_source_ids"] + second["identity_source_ids"]
+                                            + [i for r in flags for i in r.get("source_ids", [])]))
+            source_ids = [i for i in source_ids if i in active]
+            signature = sha256("|".join(f"{i}:{entry_state(active[i])}" for i in sorted(source_ids)).encode()).hexdigest()
+            if reviews.get(key, {}).get("signature") == signature:
+                continue
+            # The pointer is explicitly provisional and cites original cards from both sides.
+            for card, other in ((first, second), (second, first)):
+                pointers = card.setdefault("possibly_same_as", [])
+                pointers[:] = [p for p in pointers if p["overview_id"] != other["id"]]
+                pointers.append({"overview_id": other["id"], "source_ids": source_ids,
+                                 "status": "pending"})
+            proposals.append({"expected_output_type": "entity_identity_review", "pair": pair,
+                              "source_ids": source_ids, "signature": signature,
+                              "flagged": bool(flags)})
+    for request in requests:
+        card_id = request.get("overview_id")
+        reason = request.get("reason", "").casefold()
+        if card_id not in cards or not any(word in reason for word in ("conflat", "split", "two identities")):
+            continue
+        if any(card_id in task["pair"] for task in proposals):
+            continue
+        card = cards[card_id]
+        source_ids = [i for i in dict.fromkeys(card["identity_source_ids"]
+                     + card["candidate_source_ids"]) if i in active]
+        if len(source_ids) < 2:
+            continue
+        signature = sha256("|".join(f"{i}:{entry_state(active[i])}" for i in sorted(source_ids)).encode()).hexdigest()
+        if reviews.get(f"{card_id}|{card_id}", {}).get("signature") == signature:
+            continue
+        proposals.append({"expected_output_type": "entity_identity_review",
+                          "pair": [card_id, card_id], "source_ids": source_ids,
+                          "signature": signature, "flagged": True})
+    state["identity_review_backlog"] = [task["pair"] for task in proposals]
+    return proposals
+
+
+def build_identity_review_prompt(first: dict, second: dict, originals: list[Entry]) -> str:
+    evidence = "\n".join(f"[{entry.id}] {entry.content}" for entry in originals)
+    return f"""Determine whether these two navigation cards refer to the same identity.
+Read the original cards, including conflicts. A similar name, shared address, role,
+document, or birth date alone cannot establish sameness. A supported same decision
+requires an original card explicitly equating both identities, or a shared
+identity-specific identifier with no unresolved conflicting identifier. If one
+card conflates separate people, return split with the conflated overview ID.
+Return JSON only: {{"outcome":"same|distinct|unresolved|split",
+"source_ids":["original ID"], "basis":"explicit_equivalence|shared_identifier|difference|conflation|uncertain",
+"evidence_quote":"exact original excerpt for explicit equivalence",
+"split_overview_id":"overview ID for split only", "reason":"short explanation"}}.
+Use unresolved when the originals do not settle identity.
+
+CARD A [{first['id']}]: {render_pointer_card(first)}
+CLUES A: {first.get('identity_clues', [])}
+CARD B [{second['id']}]: {render_pointer_card(second)}
+CLUES B: {second.get('identity_clues', [])}
+ORIGINAL CARDS:
+{evidence}"""
+
+
+def _validated_identity_outcome(payload: dict, first: dict, second: dict,
+                                originals: dict[str, Entry]) -> tuple[str, list[str]]:
+    outcome = payload.get("outcome")
+    refs = payload.get("source_ids")
+    if (outcome not in {"same", "distinct", "unresolved", "split"}
+            or not isinstance(refs, list) or any(not isinstance(i, str) or i not in originals for i in refs)):
+        raise ValueError("identity review has invalid outcome or original references")
+    refs = list(dict.fromkeys(refs))
+    if outcome in {"same", "distinct", "split"} and not refs:
+        raise ValueError("identity conclusion needs original support")
+    if outcome == "split":
+        if payload.get("basis") != "conflation" or payload.get("split_overview_id") not in {first["id"], second["id"]}:
+            raise ValueError("split needs a named conflated overview")
+        return outcome, refs
+    if outcome != "same":
+        return outcome, refs
+    if first["id"] == second["id"]:
+        raise ValueError("a card cannot be merged with itself")
+    if not (set(refs) & set(first["identity_source_ids"])
+            and set(refs) & set(second["identity_source_ids"])):
+        raise ValueError("same conclusion must cite both identities")
+    identifiers = {"identifier", "registration", "registration_number", "passport", "passport_number",
+                   "tax_id", "national_id", "lei", "account_number"}
+    conflict_types = identifiers | {"birth_date", "date_of_birth", "dob"}
+    for a in first.get("identity_clues", []):
+        for b in second.get("identity_clues", []):
+            if (a["type"].casefold() == b["type"].casefold() in conflict_types
+                    and normalize_name(a["value"]) != normalize_name(b["value"])):
+                raise ValueError("conflicting identity-specific identifier")
+    basis = payload.get("basis")
+    if basis == "explicit_equivalence":
+        quote = payload.get("evidence_quote", "")
+        if (not isinstance(quote, str) or len(quote.strip()) < 12
+                or not any(quote.casefold() in originals[i].content.casefold() for i in refs)
+                or not all(normalize_name(card["name"]) in normalize_name(quote)
+                           for card in (first, second))
+                or not re.search(r"\b(?:same|alias|aka|also known as|formerly|identical)\b", quote, re.I)):
+            raise ValueError("explicit equivalence is not present in a cited original")
+    elif basis == "shared_identifier":
+        matches = [(a, b) for a, b in _clue_matches(first, second)
+                   if a["type"].casefold() in identifiers
+                   and set(a["source_ids"]) & set(refs) and set(b["source_ids"]) & set(refs)
+                   and any(a["value"].casefold() in originals[i].content.casefold()
+                           for i in a["source_ids"] if i in originals)
+                   and any(b["value"].casefold() in originals[i].content.casefold()
+                           for i in b["source_ids"] if i in originals)]
+        if not matches:
+            raise ValueError("same conclusion lacks a shared identity-specific identifier")
+    else:
+        raise ValueError("same conclusion lacks a permitted basis")
+    return outcome, refs
+
+
+def apply_identity_merge(state: dict, entries: list[Entry], first_id: str,
+                         second_id: str, refs: list[str]) -> str:
+    """Redirect the later card while retaining the exact prior state for reversal."""
+    cards = identity_cards(state)
+    first, second = cards[first_id], cards[second_id]
+    by_id = {entry.id: entry for entry in entries}
+    older, newer = sorted((first, second), key=lambda card: entries.index(by_id[card["id"]]))
+    state.setdefault("identity_history", []).append({"kind": "merge", "target": older["id"],
+        "redirected": newer["id"], "before": {card["id"]: deepcopy(card) for card in (older, newer)}})
+    older["identity_source_ids"] = list(dict.fromkeys(older["identity_source_ids"] + newer["identity_source_ids"]))
+    older["candidate_source_ids"] = list(dict.fromkeys(older["candidate_source_ids"]
+        + newer["candidate_source_ids"]))
+    older.setdefault("merged_from", []).append(newer["id"])
+    newer["redirect_to"] = older["id"]
+    # Facts on the redirected card are intentionally not copied to the target.
+    by_id[older["id"]].supports_entries = older["identity_source_ids"][:]
+    by_id[older["id"]].content = render_pointer_card(older)
+    by_id[newer["id"]].status = "inactive"
+    return older["id"]
+
+
+def reverse_identity_merge(state: dict, entries: list[Entry], redirected_id: str) -> bool:
+    """Restore two cards from the saved pre-merge snapshot when later evidence warrants it."""
+    history = state.get("identity_history", [])
+    item = next((h for h in reversed(history) if h.get("kind") == "merge"
+                 and h.get("redirected") == redirected_id and not h.get("reversed")), None)
+    if not item:
+        return False
+    for record in state.get("overviews", {}).values():
+        for index, card in enumerate(record.get("cards", [])):
+            if card["id"] in item["before"]:
+                record["cards"][index] = deepcopy(item["before"][card["id"]])
+    for entry in entries:
+        if entry.id in item["before"]:
+            card = item["before"][entry.id]
+            entry.status = "active"
+            entry.supports_entries = card["identity_source_ids"][:]
+            entry.content = render_pointer_card(card)
+        if entry.id == item.get("finding_id"):
+            entry.status = "inactive"
+    item["reversed"] = True
+    return True
 
 
 def validate_structured_overview(value: object, eligible_ids: set[str]) -> tuple[dict, list[str]]:

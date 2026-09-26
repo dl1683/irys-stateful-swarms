@@ -381,6 +381,24 @@ def execute_workers_parallel(worker_tasks: list[dict], blackboard: Blackboard,
 
     def run_one(task: dict) -> WorkerOutput:
         wid = f"w{blackboard.iteration}_{uuid.uuid4().hex[:4]}"
+        if task.get("expected_output_type") == "entity_identity_review":
+            from .entity_overview import build_identity_review_prompt, identity_cards
+            cards = identity_cards(blackboard.entity_overview_state)
+            first, second = (cards[i] for i in task["pair"])
+            originals = blackboard.get_entries_by_ids(task["source_ids"])
+            set_last_call_usage(None)
+            try:
+                payload, tokens = call_model(smart_caller or caller,
+                    build_identity_review_prompt(first, second, originals), max_tokens=2048)
+                _, model, t_in, t_out = get_last_call_usage()
+                return WorkerOutput([], tokens, t_in, t_out, model, wid,
+                    {**task, "identity_payload": payload, "entity_caller_fallback": smart_caller is None,
+                     "provider_attempts": get_last_provider_attempts()}, [])
+            except Exception as exc:
+                _, model, t_in, t_out = get_last_call_usage()
+                return WorkerOutput([], t_in + t_out, t_in, t_out, model, wid,
+                    {**task, "entity_error": str(exc), "entity_caller_fallback": smart_caller is None,
+                     "provider_attempts": get_last_provider_attempts() if model else None}, [])
         if task.get("expected_output_type") == "entity_delta":
             from .entity_overview import build_delta_prompt
             record = blackboard.entity_overview_state.get("overviews", {}).get(task.get("entity_group_id"), {})

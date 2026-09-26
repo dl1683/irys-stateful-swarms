@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,7 +28,7 @@ from .derived_work import (
 )
 from .obligations import build_synthesis_obligations
 from .models import (
-    Document, DocumentStatus, Entry, EntrySource, ModelCaller, Task,
+    Document, DocumentStatus, Entry, EntrySource, EpistemicStatus, ModelCaller, Task, WorkerRecord,
     gen_entry_id,
 )
 from .orchestrator import run_orchestrator
@@ -66,6 +67,8 @@ from .entity_overview import (
     discover_pending_names, entry_state,
     overview_inventory, prepare_overview_tasks, render_pointer_card,
     select_delta_tasks, sync_overview_references,
+    select_identity_reviews, identity_cards, build_identity_review_prompt,
+    _validated_identity_outcome, apply_identity_merge, validate_pointer_cards,
 )
 
 
@@ -211,6 +214,135 @@ def _run_due_deltas(blackboard: Blackboard, caller: ModelCaller, *, final: bool 
             "output_tokens": output.tokens_output, "provider_attempts": task.get("provider_attempts"),
             "failed": bool(error),
         })
+
+
+def _run_split_rebuild(blackboard: Blackboard, card_id: str, caller: ModelCaller) -> tuple[int, int, int, str]:
+    """Rebuild only a model-confirmed conflated card, preserving the old card."""
+    from .entity_overview import build_overview_prompt
+    from .worker_dispatch import get_last_call_usage
+    state = blackboard.entity_overview_state
+    card = identity_cards(state)[card_id]
+    originals = blackboard.get_entries_by_ids(card["identity_source_ids"] + card["candidate_source_ids"])
+    matched = [(entry, "confirmed conflation") for entry in originals if entry.status == "active"]
+    prompt = build_overview_prompt(card["name"], [card["name"]], matched)
+    if len(prompt.encode("utf-8")) + 8192 > blackboard.token_budget - blackboard.total_tokens_used:
+        raise ValueError("split rebuild exceeds remaining token budget")
+    payload, tokens = call_model(caller, prompt,
+                                 max_tokens=8192)
+    cards = validate_pointer_cards(payload.get("cards"), {entry.id for entry, _ in matched})
+    if len(cards) < 2 or set.intersection(*(set(c["identity_source_ids"]) for c in cards)):
+        raise ValueError("split rebuild needs separate source-backed identities")
+    state.setdefault("identity_history", []).append({"kind": "split", "old_id": card_id,
+                                                       "before": deepcopy(card)})
+    replacements = []
+    for rebuilt in cards:
+        rebuilt["id"] = gen_entry_id()
+        rebuilt["split_from"] = card_id
+        replacements.append(rebuilt)
+        blackboard.add_entries_batch([Entry(id=rebuilt["id"], type="entity_overview",
+            content=render_pointer_card(rebuilt), supports_entries=rebuilt["identity_source_ids"][:],
+            epistemic=EpistemicStatus("inference", "unknown", ""),
+            created_by=WorkerRecord("identity_rebuild", "confirmed split", blackboard.iteration),
+            status="active")])
+    for record in state.get("overviews", {}).values():
+        if any(c["id"] == card_id for c in record.get("cards", [])):
+            record["cards"] = [c for c in record["cards"] if c["id"] != card_id] + replacements
+            record["card_ids"] = [c["id"] for c in record["cards"]]
+            record["entry_id"] = record["card_ids"][0]
+    next(entry for entry in blackboard.entries if entry.id == card_id).status = "inactive"
+    _, model, t_in, t_out = get_last_call_usage()
+    return tokens, t_in, t_out, model
+
+
+def _run_identity_reviews(blackboard: Blackboard, caller: ModelCaller,
+                          smart_caller: ModelCaller | None) -> None:
+    """Review at most three candidate pairs after all document reading."""
+    state = blackboard.entity_overview_state
+    _sync_entity_state(blackboard)
+    proposals = select_identity_reviews(state, blackboard.entries)
+    _sync_entity_state(blackboard)
+    if not proposals:
+        return
+    remaining = blackboard.token_budget - blackboard.total_tokens_used
+    selected = []
+    for task in proposals:
+        cards = identity_cards(state)
+        originals = blackboard.get_entries_by_ids(task["source_ids"])
+        estimate = len(build_identity_review_prompt(cards[task["pair"][0]], cards[task["pair"][1]],
+                                                    originals).encode("utf-8")) + 2048
+        if len(selected) < 3 and estimate <= remaining:
+            selected.append(task)
+            remaining -= estimate
+    state["identity_review_backlog"] = [task["pair"] for task in proposals if task not in selected]
+    if not selected:
+        return
+    outputs = execute_workers_parallel(selected, blackboard, caller, smart_caller=smart_caller)
+    for output in outputs:
+        task = output.task
+        pair = task["pair"]
+        key = "|".join(pair)
+        blackboard.add_tokens(output.tokens_used, output.tokens_input, output.tokens_output, output.model)
+        usage = state.setdefault("usage", {})
+        usage["identity_review_calls"] = usage.get("identity_review_calls", 0) + bool(output.tokens_used)
+        usage["identity_review_tokens"] = usage.get("identity_review_tokens", 0) + output.tokens_used
+        cards = identity_cards(state)
+        original = {e.id: e for e in blackboard.get_entries_by_ids(task["source_ids"])
+                    if e.status == "active" and e.type != "entity_overview"}
+        outcome = "unresolved"
+        error = task.get("entity_error", "")
+        refs = []
+        if not error:
+            try:
+                payload = task["identity_payload"]
+                outcome, refs = _validated_identity_outcome(payload, cards[pair[0]], cards[pair[1]], original)
+                if outcome == "same":
+                    target = apply_identity_merge(state, blackboard.entries, *pair, refs)
+                    finding = Entry(id=gen_entry_id(), type="analysis",
+                        content=f"Identity review: overviews {pair[0]} and {pair[1]} identify the same entity; use {target} for lookup.",
+                        supports_entries=refs, epistemic=EpistemicStatus("inference", "unknown", ""),
+                        created_by=WorkerRecord("identity_review", "source-grounded duplicate review",
+                                                blackboard.iteration), status="active")
+                    blackboard.add_entries_batch([finding])
+                    state["identity_history"][-1]["finding_id"] = finding.id
+                elif outcome == "split":
+                    split_id = payload["split_overview_id"]
+                    from .worker_dispatch import get_last_call_usage, set_last_call_usage
+                    set_last_call_usage(None)
+                    rebuild_error = ""
+                    try:
+                        tokens, t_in, t_out, model = _run_split_rebuild(
+                            blackboard, split_id, smart_caller or caller)
+                    except (ValueError, RuntimeError) as exc:
+                        _, model, t_in, t_out = get_last_call_usage()
+                        tokens = t_in + t_out
+                        rebuild_error = str(exc)
+                    blackboard.add_tokens(tokens, t_in, t_out, model)
+                    usage["identity_rebuild_calls"] = usage.get("identity_rebuild_calls", 0) + bool(tokens)
+                    usage["identity_rebuild_tokens"] = usage.get("identity_rebuild_tokens", 0) + tokens
+                    state.setdefault("jobs", []).append({"iteration": blackboard.iteration,
+                        "kind": "identity_rebuild", "entity_id": split_id, "model": model,
+                        "input_tokens": t_in, "output_tokens": t_out,
+                        "failed": bool(rebuild_error), "error": rebuild_error[:300]})
+                    if rebuild_error:
+                        raise ValueError(rebuild_error)
+                for card in (cards[pair[0]], cards[pair[1]]):
+                    for pointer in card.get("possibly_same_as", []):
+                        if pointer["overview_id"] in pair:
+                            pointer["status"] = outcome
+            except (ValueError, KeyError, TypeError, RuntimeError) as exc:
+                error = str(exc)
+        state.setdefault("identity_reviews", {})[key] = {
+            "signature": task["signature"], "outcome": outcome if not error else "unresolved",
+            "source_ids": refs, "error": error[:300]}
+        if task.get("entity_caller_fallback"):
+            state.setdefault("caller_fallbacks", []).append({"iteration": blackboard.iteration,
+                "entity_id": key, "reason": "smart caller unavailable"})
+        state.setdefault("jobs", []).append({"iteration": blackboard.iteration,
+            "kind": "identity_review", "entity_id": key, "model": output.model,
+            "input_tokens": output.tokens_input, "output_tokens": output.tokens_output,
+            "provider_attempts": task.get("provider_attempts"), "failed": bool(error),
+            "outcome": outcome if not error else "unresolved"})
+    _sync_entity_state(blackboard)
 
 
 def _after_document_round(blackboard: Blackboard, outputs: list,
@@ -757,6 +889,7 @@ def run_swarm(task: Task, caller: ModelCaller, *,
     _run_due_deltas(blackboard, caller, final=True)
     enforce_source_custody(blackboard, "pre_state_conversion")
     _sync_entity_state(blackboard)
+    _run_identity_reviews(blackboard, caller, smart_caller)
 
     # Phase 7a: State conversion review — convert observations into analytical state
     if review_caller is not None:
