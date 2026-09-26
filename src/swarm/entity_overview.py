@@ -541,10 +541,19 @@ def sync_overview_references(state: dict, entries: list[Entry],
                 old = fact["source_ids"]
                 fact["source_ids"] = [i for i in old if i in valid]
                 if len(old) != len(fact["source_ids"]):
-                    hint = next((i for i in current if i not in valid
+                    hint = next((i for i in current if i not in old
                                  and fact["text"].casefold() in by_id[i].content.casefold()), "")
                     if not hint:
-                        hint = next((candidate for candidate in current if candidate not in valid
+                        # Exact identifiers are useful repair leads even when surrounding prose differs.
+                        identifiers = re.findall(
+                            r"\b(?=[A-Za-z0-9.-]*\d)[A-Za-z0-9][A-Za-z0-9.-]{5,}\b",
+                            fact["text"],
+                        )
+                        hint = next((i for i in current if i not in old
+                                     and any(value.casefold() in by_id[i].content.casefold()
+                                             for value in identifiers)), "")
+                    if not hint:
+                        hint = next((candidate for candidate in current if candidate not in old
                                      and any(by_id.get(lost) and by_id[lost].source
                                              and by_id[candidate].source.document == by_id[lost].source.document
                                              and by_id[candidate].source.section == by_id[lost].source.section

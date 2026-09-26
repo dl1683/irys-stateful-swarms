@@ -206,3 +206,20 @@ def test_failed_initial_validation_keeps_model_usage(tmp_path):
     assert state["jobs"][0]["output_tokens"] == 8
     assert state["jobs"][0]["failed"]
     assert state["usage"]["initial_tokens"] == 20
+
+
+def test_repair_hint_finds_exact_identifier_in_existing_original(tmp_path):
+    board = board_with_card(tmp_path, new_count=0)
+    original, lost = board.entries[0], board.entries[1]
+    original.content = "Buyer Meridian AG, register CHE-198.765.432."
+    lost.content = "Meridian AG Swiss Commercial Register No.: CHE-198.765.432"
+    card = board.entity_overview_state["overviews"]["meridian"]["cards"][0]
+    card["facts"] = [{"text": "Swiss Commercial Register No. for Meridian AG: CHE-198.765.432",
+                      "source_ids": [lost.id]}]
+    board.entity_overview_state["overviews"]["meridian"]["source_states"] = {
+        original.id: entry_state(original), lost.id: entry_state(lost)}
+    lost.status = "inactive"
+    _sync_entity_state(board)
+    error = board.entity_overview_state["reference_errors"][0]
+    assert error["candidate_id"] == original.id
+    assert card["facts"] == []
