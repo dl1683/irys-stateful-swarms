@@ -7,7 +7,7 @@ import pytest
 from src.swarm import _prepare_entity_work, _run_initial_overviews
 from src.swarm.blackboard import Blackboard
 from src.swarm.entity_overview import validate_pointer_cards
-from src.swarm.models import Entry, EntrySource, ModelResult
+from src.swarm.models import DocumentStatus, Entry, EntrySource, ModelResult
 from src.swarm.synthesis import _selected_evidence_text
 from src.swarm.synthesis_packet import build_synthesis_packet
 
@@ -36,6 +36,7 @@ def test_initial_identity_cards_attach_and_writers_follow_originals(tmp_path):
         ], 1)
     ]
     board = Blackboard(task_instruction="Report on the applicant", entries=entries,
+                       documents=[DocumentStatus(name="identity.txt")],
                        output_dir=str(tmp_path))
     board.entity_overview_state = {"variants": {"alex rowan": ["Alex Rowan"]}}
     ordinary = Caller({})
@@ -55,6 +56,7 @@ def test_initial_identity_cards_attach_and_writers_follow_originals(tmp_path):
     _run_initial_overviews(board, ordinary, smart)
     assert not ordinary.prompts
     assert len(smart.prompts) == 1
+    assert board.entity_overview_state.get("document_rounds", 0) == 0
     cards = board.entity_overview_state["overviews"]["alex rowan"]["cards"]
     assert len(cards) == 2
     assert all("src7" not in card["identity_source_ids"] for card in cards)

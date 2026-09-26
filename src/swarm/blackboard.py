@@ -202,6 +202,8 @@ class Blackboard:
 
     def add_tokens_from_last_call(self, tokens: int) -> None:
         """Add tokens and grab model info from the last call_model invocation."""
+        if tokens <= 0:
+            return
         from .worker_dispatch import get_last_call_usage
         by_model, model, t_in, t_out = get_last_call_usage()
         if isinstance(by_model, dict) and by_model:
@@ -434,6 +436,13 @@ class Blackboard:
                                        for card in record.get("cards", [])}) or len(overviews),
                 "overviews": overviews,
                 "usage": entity_state.get("usage", {}),
+                "jobs": entity_state.get("jobs", []),
+                "document_rounds": entity_state.get("document_rounds", 0),
+                "delta_backlog": entity_state.get("delta_backlog", []),
+                "delta_errors": entity_state.get("delta_errors", []),
+                "reference_errors": entity_state.get("reference_errors", []),
+                "overview_review_requests": entity_state.get("overview_review_requests", []),
+                "identity_review_requests": entity_state.get("identity_review_requests", []),
                 "caller_fallbacks": entity_state.get("caller_fallbacks", []),
                 "recipients": entity_state.get("recipients", []),
                 "recipient_count": len(entity_state.get("recipients", [])),

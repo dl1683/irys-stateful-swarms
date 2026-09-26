@@ -61,9 +61,11 @@ from .worker_dispatch import (
     passes_quality_gate,
 )
 from .entity_overview import (
-    attach_relevant_overviews, automatic_overview_tasks,
+    NameCatalogue, apply_delta, attach_relevant_overviews, automatic_overview_tasks,
+    build_delta_prompt, build_overview_prompt,
     discover_pending_names, entry_state,
-    overview_inventory, prepare_overview_tasks,
+    overview_inventory, prepare_overview_tasks, render_pointer_card,
+    select_delta_tasks, sync_overview_references,
 )
 
 
@@ -98,13 +100,130 @@ def _run_initial_overviews(blackboard: Blackboard, caller: ModelCaller,
                            smart_caller: ModelCaller | None) -> None:
     """Run eligible creation after readers commit, outside their worker batch."""
     state = blackboard.entity_overview_state
+    registered = {doc.name for doc in blackboard.documents}
     while True:
-        inventory = overview_inventory(state, blackboard.entries, blackboard.iteration)
+        inventory = overview_inventory(state, blackboard.entries, blackboard.iteration, registered)
         tasks = automatic_overview_tasks(inventory, state, blackboard.iteration)
         if not tasks:
             break
-        outputs = execute_workers_parallel(tasks, blackboard, caller, smart_caller=smart_caller)
+        remaining = blackboard.token_budget - blackboard.total_tokens_used
+        eligible = []
+        for task in tasks:
+            group_id = task["entity_overview_id"]
+            catalogue = NameCatalogue({group_id: set(task["entity_variants"])})
+            matched = [(entry, reason) for entry, reason in catalogue.matched_entries(
+                blackboard.entries, group_id) if entry.id in task["entity_source_ids"]]
+            estimate = len(build_overview_prompt(group_id, task["entity_variants"], matched).encode("utf-8")) + 8192
+            if estimate <= remaining:
+                eligible.append(task)
+                remaining -= estimate
+            else:
+                state.setdefault("budget_limited", []).append(group_id)
+                for field in ("pending", "initial_queue"):
+                    state[field] = [key for key in state.get(field, [])
+                                    if key not in task["entity_overview_group_ids"]]
+        if not eligible:
+            break
+        outputs = execute_workers_parallel(eligible, blackboard, caller, smart_caller=smart_caller)
         _commit_entity_worker_outputs(blackboard, outputs, caller, blackboard.iteration)
+
+
+def _sync_entity_state(blackboard: Blackboard) -> None:
+    sync_overview_references(blackboard.entity_overview_state, blackboard.entries,
+                             {doc.name for doc in blackboard.documents}, blackboard.iteration)
+
+
+def _run_due_deltas(blackboard: Blackboard, caller: ModelCaller, *, final: bool = False) -> None:
+    """One bounded wave at each due point, including the final reading checkpoint."""
+    state = blackboard.entity_overview_state
+    if final and state.get("final_delta_done"):
+        return
+    _sync_entity_state(blackboard)
+    inventory = overview_inventory(state, blackboard.entries, blackboard.iteration,
+                                   {doc.name for doc in blackboard.documents})
+    tasks = select_delta_tasks(state, inventory, blackboard.entries)
+    if final:
+        state["final_delta_done"] = True
+    if not tasks:
+        return
+    remaining = blackboard.token_budget - blackboard.total_tokens_used
+    eligible = []
+    for task in tasks:
+        record = state["overviews"][task["entity_group_id"]]
+        card = next(card for card in record["cards"] if card["id"] == task["entity_card_id"])
+        sources = blackboard.get_entries_by_ids(task["entity_delta_source_ids"])
+        # UTF-8 bytes conservatively bound input tokens; delta output is capped at 2048.
+        estimate = len(build_delta_prompt(card, sources, task["entity_hints"]).encode("utf-8")) + 2048
+        if estimate <= remaining:
+            eligible.append(task)
+            remaining -= estimate
+        else:
+            state.setdefault("budget_limited", []).append(task["entity_card_id"])
+            state.setdefault("delta_backlog", []).append(task["entity_card_id"])
+    tasks = eligible
+    if not tasks:
+        return
+    outputs = execute_workers_parallel(tasks, blackboard, caller)
+    by_id = {entry.id: entry for entry in blackboard.entries if entry.status == "active"
+             and entry.source and entry.source.document in {doc.name for doc in blackboard.documents}}
+    for output in outputs:
+        blackboard.add_tokens(output.tokens_used, output.tokens_input, output.tokens_output, output.model)
+        usage = state.setdefault("usage", {})
+        usage["delta_calls"] = usage.get("delta_calls", 0) + bool(output.tokens_used)
+        usage["delta_tokens"] = usage.get("delta_tokens", 0) + output.tokens_used
+        task = output.task
+        record = state["overviews"][task["entity_group_id"]]
+        index = next(i for i, card in enumerate(record["cards"])
+                     if card["id"] == task["entity_card_id"])
+        card = record["cards"][index]
+        error = task.get("entity_error", "")
+        if not error:
+            try:
+                revised = apply_delta(card, task["entity_delta_payload"],
+                                      set(task["entity_delta_source_ids"]), by_id)
+                revised["semantic_input_ids"] = inventory[
+                    next(i for i, item in enumerate(inventory)
+                         if item["entity_id"] == task["entity_group_id"])
+                ]["source_card_ids"]
+                card.clear()
+                card.update(revised)
+                entry = by_id.get(card["id"])
+                if entry is None:
+                    entry = next((e for e in blackboard.entries if e.id == card["id"]), None)
+                if entry and revised["identity_source_ids"]:
+                    entry.status = "active"
+                    entry.supports_entries = revised["identity_source_ids"][:]
+                    entry.content = render_pointer_card(revised)
+                state["overview_review_requests"] = [r for r in state.get("overview_review_requests", [])
+                                                      if r["overview_id"] != card["id"]]
+            except (ValueError, KeyError, TypeError) as exc:
+                error = str(exc)
+        if error:
+            card["failed_delta_signature"] = task["entity_signature"]
+            state.setdefault("delta_errors", []).append({
+                "iteration": blackboard.iteration, "entity_id": card["id"],
+                "job_kind": "delta", "reason": error[:300],
+                "affected_card_ids": task["entity_delta_source_ids"],
+            })
+        state.setdefault("jobs", []).append({
+            "iteration": blackboard.iteration, "kind": "delta", "entity_id": card["id"],
+            "model": output.model, "input_tokens": output.tokens_input,
+            "output_tokens": output.tokens_output, "provider_attempts": task.get("provider_attempts"),
+            "failed": bool(error),
+        })
+
+
+def _after_document_round(blackboard: Blackboard, outputs: list,
+                          caller: ModelCaller) -> None:
+    """Initial reading and analysis-only rounds do not advance the delta clock."""
+    registered = {doc.name for doc in blackboard.documents}
+    if not any(doc_name in registered for output in outputs
+               for doc_name, _ in output.sections_read):
+        return
+    state = blackboard.entity_overview_state
+    state["document_rounds"] = state.get("document_rounds", 0) + 1
+    if state["document_rounds"] % 3 == 0:
+        _run_due_deltas(blackboard, caller)
 
 
 def _commit_entity_worker_outputs(blackboard: Blackboard, outputs: list,
@@ -126,6 +245,9 @@ def _commit_entity_worker_outputs(blackboard: Blackboard, outputs: list,
     for output in outputs:
         if output.task.get("expected_output_type") != "entity_overview":
             continue
+        usage = state.setdefault("usage", {})
+        usage["initial_calls"] = usage.get("initial_calls", 0) + bool(output.tokens_used)
+        usage["initial_tokens"] = usage.get("initial_tokens", 0) + output.tokens_used
         if output.task.get("entity_caller_fallback"):
             state.setdefault("caller_fallbacks", []).append({
                 "iteration": iteration, "entity_id": output.task.get("entity_overview_id"),
@@ -145,13 +267,20 @@ def _commit_entity_worker_outputs(blackboard: Blackboard, outputs: list,
                 "iteration": iteration, "group_ids": group_ids,
                 "error": output.task.get("entity_error", "unusable overview output")[:300],
             })
+            state.setdefault("jobs", []).append({
+                "iteration": iteration, "kind": "initial", "entity_id": group_ids[0],
+                "model": output.model, "input_tokens": output.tokens_input,
+                "output_tokens": output.tokens_output,
+                "provider_attempts": output.task.get("provider_attempts"), "failed": True,
+            })
             continue
         for group_id in group_ids:
             state.setdefault("overviews", {})[group_id] = {
                 "entry_id": cards[0].id,
                 "card_ids": [card.id for card in cards],
                 "input_ids": output.task.get("entity_input_ids", []),
-                "cards": [dict(card, id=entry.id) for card, entry in
+                "cards": [dict(card, id=entry.id,
+                               semantic_input_ids=output.task.get("entity_input_ids", [])) for card, entry in
                           zip(output.task["entity_cards"], cards)],
                 "source_states": {
                     entry.id: entry_state(entry) for entry in blackboard.entries
@@ -160,11 +289,18 @@ def _commit_entity_worker_outputs(blackboard: Blackboard, outputs: list,
                 },
                 "last_success_iteration": iteration,
             }
+        state.setdefault("jobs", []).append({
+            "iteration": iteration, "kind": "initial", "entity_id": cards[0].id,
+            "model": output.model, "input_tokens": output.tokens_input,
+            "output_tokens": output.tokens_output,
+            "provider_attempts": output.task.get("provider_attempts"), "failed": False,
+        })
         usage = state.setdefault("usage", {})
         usage["overview_tokens"] = usage.get("overview_tokens", 0) + output.tokens_used
         usage["overview_calls"] = usage.get("overview_calls", 0) + 1
 
-    overview_ids = {record.get("entry_id") for record in state.get("overviews", {}).values()}
+    overview_ids = {card["id"] for record in state.get("overviews", {}).values()
+                    for card in record.get("cards", [])}
     for output in outputs:
         consumed = [entry_id for entry_id in output.task.get("reads_from_blackboard", [])
                     if entry_id in overview_ids]
@@ -176,6 +312,20 @@ def _commit_entity_worker_outputs(blackboard: Blackboard, outputs: list,
                                             if any(entry_id in entry.supports_entries
                                                    for entry in output.entries)],
             })
+        attached = {item["overview_id"] for item in output.task.get("entity_overview_attachments", [])}
+        for request in output.task.get("overview_review_requests", []):
+            if not isinstance(request, dict) or request.get("overview_id") not in attached:
+                continue
+            reason = request.get("reason", "")
+            if not isinstance(reason, str) or not reason.strip():
+                continue
+            kind = ("identity_review_requests" if any(word in reason.casefold()
+                    for word in ("identity", "duplicate", "same person", "same entity"))
+                    else "overview_review_requests")
+            item = {"overview_id": request["overview_id"], "reason": reason.strip()[:250]}
+            queue = state.setdefault(kind, [])
+            if item not in queue:
+                queue.append(item)
 
     direct_entries = [entry for output in outputs if output.sections_read
                       for entry in output.entries if entry in new_entries
@@ -192,6 +342,7 @@ def _commit_entity_worker_outputs(blackboard: Blackboard, outputs: list,
                 usage["name_discovery_calls"] = usage.get("name_discovery_calls", 0) + 1
         except (ValueError, RuntimeError) as error:
             _record_entity_discovery_failure(state, iteration, error)
+    _sync_entity_state(blackboard)
     return len(new_entries)
 
 
@@ -536,6 +687,7 @@ def run_swarm(task: Task, caller: ModelCaller, *,
 
         _entries_per_iter.append(_commit_entity_worker_outputs(blackboard, outputs, iter_caller, iteration))
         _run_initial_overviews(blackboard, caller, smart_caller)
+        _after_document_round(blackboard, outputs, caller)
 
         new_sigs = [
             s for s in blackboard.signals
@@ -599,9 +751,12 @@ def run_swarm(task: Task, caller: ModelCaller, *,
                 outputs = execute_workers_parallel(tasks_list, blackboard, loop_caller)
                 _commit_entity_worker_outputs(blackboard, outputs, loop_caller, blackboard.iteration)
                 _run_initial_overviews(blackboard, caller, smart_caller)
+                _after_document_round(blackboard, outputs, caller)
             blackboard.save_snapshot(f"post_supervisor_{review_round}")
 
+    _run_due_deltas(blackboard, caller, final=True)
     enforce_source_custody(blackboard, "pre_state_conversion")
+    _sync_entity_state(blackboard)
 
     # Phase 7a: State conversion review — convert observations into analytical state
     if review_caller is not None:
@@ -652,6 +807,7 @@ def run_swarm(task: Task, caller: ModelCaller, *,
         blackboard.save_snapshot("post_state_repair")
 
     custody_report = enforce_source_custody(blackboard, "post_state_repair")
+    _sync_entity_state(blackboard)
 
     if review_caller is not None and blackboard_maintenance_enabled():
         _, maintenance_tokens = run_blackboard_maintenance(
@@ -660,6 +816,7 @@ def run_swarm(task: Task, caller: ModelCaller, *,
         if maintenance_tokens:
             blackboard.add_tokens_from_last_call(maintenance_tokens)
         custody_report = enforce_source_custody(blackboard, "post_blackboard_maintenance")
+        _sync_entity_state(blackboard)
 
     debt_sensor_report = None
     if review_caller is not None and debt_sensors_enabled():
@@ -669,6 +826,7 @@ def run_swarm(task: Task, caller: ModelCaller, *,
         if debt_sensor_tokens:
             blackboard.add_tokens_from_last_call(debt_sensor_tokens)
         custody_report = enforce_source_custody(blackboard, "post_debt_sensors")
+        _sync_entity_state(blackboard)
 
     derived_work_report = None
     if review_caller is not None and calculation_debt_enabled():
@@ -678,7 +836,9 @@ def run_swarm(task: Task, caller: ModelCaller, *,
         if calc_debt_tokens:
             blackboard.add_tokens_from_last_call(calc_debt_tokens)
         custody_report = enforce_source_custody(blackboard, "post_calculation_debt_detection")
+        _sync_entity_state(blackboard)
 
+    _sync_entity_state(blackboard)
     blackboard.save_snapshot("post_processing")
 
     # Phase 7b: Synthesis Readiness Gate

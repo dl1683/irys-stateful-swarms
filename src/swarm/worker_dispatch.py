@@ -62,6 +62,7 @@ def call_model(caller: ModelCaller, prompt: str, *,
     _usage_state.last_model = result.model
     _usage_state.last_in = result.tokens_input
     _usage_state.last_out = result.tokens_output
+    _usage_state.last_provider_attempts = getattr(result, "provider_attempts", 1)
     _usage_state.last_by_model = by_model
     _record_aggregate_usage(result)
     text = result.text.strip()
@@ -99,6 +100,10 @@ def get_last_call_usage() -> tuple[dict, str, int, int]:
         getattr(_usage_state, "last_in", 0),
         getattr(_usage_state, "last_out", 0),
     )
+
+
+def get_last_provider_attempts() -> int:
+    return getattr(_usage_state, "last_provider_attempts", 1)
 
 
 def set_last_call_usage(by_model: dict | None) -> None:
@@ -376,11 +381,28 @@ def execute_workers_parallel(worker_tasks: list[dict], blackboard: Blackboard,
 
     def run_one(task: dict) -> WorkerOutput:
         wid = f"w{blackboard.iteration}_{uuid.uuid4().hex[:4]}"
+        if task.get("expected_output_type") == "entity_delta":
+            from .entity_overview import build_delta_prompt
+            record = blackboard.entity_overview_state.get("overviews", {}).get(task.get("entity_group_id"), {})
+            card = next((item for item in record.get("cards", []) if item["id"] == task.get("entity_card_id")), None)
+            if card is None:
+                return WorkerOutput([], 0, 0, 0, "", wid, {**task, "entity_error": "missing delta card"}, [])
+            sources = blackboard.get_entries_by_ids(task.get("entity_delta_source_ids", []))
+            try:
+                payload, tokens = call_model(caller, build_delta_prompt(card, sources, task.get("entity_hints", [])),
+                                             max_tokens=2048)
+                _, model, t_in, t_out = get_last_call_usage()
+                task = {**task, "entity_delta_payload": payload,
+                        "provider_attempts": get_last_provider_attempts()}
+                return WorkerOutput([], tokens, t_in, t_out, model, wid, task, [])
+            except Exception as exc:
+                return WorkerOutput([], 0, 0, 0, "", wid, {**task, "entity_error": str(exc)}, [])
         if task.get("expected_output_type") == "entity_overview":
             from .entity_overview import NameCatalogue, run_entity_overview
             entity_id = str(task.get("entity_overview_id", ""))
             variants = task.get("entity_variants", [])
             catalogue = NameCatalogue({entity_id: set(variants)})
+            set_last_call_usage(None)
             try:
                 record = blackboard.entity_overview_state.get("overviews", {}).get(entity_id, {})
                 entries, input_ids, tokens, structured = run_entity_overview(
@@ -391,11 +413,15 @@ def execute_workers_parallel(worker_tasks: list[dict], blackboard: Blackboard,
                 )
             except (RuntimeError, ValueError) as exc:
                 # A failed prerequisite is recorded by the loop, not retried forever.
-                return WorkerOutput([], 0, 0, 0, "", wid, {**task, "entity_error": str(exc),
-                    "entity_caller_fallback": smart_caller is None}, [])
+                _, model, t_in, t_out = get_last_call_usage()
+                return WorkerOutput([], t_in + t_out, t_in, t_out, model, wid,
+                    {**task, "entity_error": str(exc),
+                     "entity_caller_fallback": smart_caller is None,
+                     "provider_attempts": get_last_provider_attempts() if model else None}, [])
             _, model, t_in, t_out = get_last_call_usage()
             task = {**task, "entity_input_ids": input_ids, "entity_cards": structured,
-                    "entity_caller_fallback": smart_caller is None}
+                    "entity_caller_fallback": smart_caller is None,
+                    "provider_attempts": get_last_provider_attempts()}
             return WorkerOutput(entries, tokens, t_in, t_out, model, wid, task, [])
         assigned_ids = _assigned_signal_ids(task, blackboard)
         assigned_signals = _assigned_signal_details(assigned_ids, blackboard)
@@ -447,6 +473,13 @@ def execute_workers_parallel(worker_tasks: list[dict], blackboard: Blackboard,
             doc_sections, blackboard.task_instruction, assigned_signals,
             web_search_results=web_results,
         )
+        attached_ids = [item["overview_id"] for item in task.get("entity_overview_attachments", [])]
+        if attached_ids:
+            prompt += ("\nIf new evidence exposes an identity ambiguity or material error on an "
+                       "attached overview, optionally return top-level "
+                       "overview_review_requests: [{overview_id, reason}]. "
+                       f"Only these IDs are attached: {', '.join(attached_ids)}. "
+                       "Put the underlying evidence in ordinary findings.")
         # Route analytical workers to smarter model if available
         expected_type = task.get("expected_output_type", "observation")
         use_caller = caller
@@ -465,6 +498,8 @@ def execute_workers_parallel(worker_tasks: list[dict], blackboard: Blackboard,
             valid_doc_names=_valid_docs,
         )
         _attach_assigned_signal_ids(entries, assigned_ids)
+        if attached_ids and isinstance(payload.get("overview_review_requests"), list):
+            task = {**task, "overview_review_requests": payload["overview_review_requests"]}
         return WorkerOutput(entries, tokens, t_in, t_out, result.model, wid, task, sections_read)
 
     if not worker_tasks:

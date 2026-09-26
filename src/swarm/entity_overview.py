@@ -193,7 +193,8 @@ def discover_pending_names(state: dict, entries: list[Entry], caller: ModelCalle
     return added, tokens
 
 
-def overview_inventory(state: dict, entries: list[Entry], iteration: int = 999) -> list[dict]:
+def overview_inventory(state: dict, entries: list[Entry], iteration: int = 999,
+                       registered_docs: set[str] | None = None) -> list[dict]:
     """Describe current overview availability and non-duplicated update suggestions."""
     catalogue = _catalogue_from_state(state)
     records = state.setdefault("overviews", {})
@@ -206,16 +207,23 @@ def overview_inventory(state: dict, entries: list[Entry], iteration: int = 999) 
     for entity_id in sorted(catalogue.variants):
         matched = catalogue.matched_entries(original, entity_id)
         matched_ids = [entry.id for entry, _ in matched]
-        source_backed = [entry for entry, _ in matched if _is_qualifying_source(entry, state)]
+        source_backed = [entry for entry, _ in matched if _is_qualifying_source(entry, state)
+                         and (registered_docs is None or entry.source.document in registered_docs)]
         source_ids = [entry.id for entry in source_backed]
         source_documents = sorted({entry.source.document for entry in source_backed})
         record = records.get(entity_id, {})
         previous_ids = set(record.get("input_ids", []))
-        new_count = len(set(source_ids) - previous_ids)
-        previous_states = record.get("source_states", {})
+        if record.get("cards"):
+            new_count = max(len(set(source_ids) - set(card.get("semantic_input_ids", previous_ids)))
+                            for card in record["cards"])
+            prior_states = {i: old for card in record["cards"]
+                            for i, old in card.get("support_states", {}).items()}
+        else:
+            new_count = len(set(source_ids) - previous_ids)
+            prior_states = record.get("source_states", {})
         changed_ids = [entry.id for entry in source_backed
-                       if entry.id in previous_states and previous_states[entry.id] != entry_state(entry)]
-        inactive_ids = [entry_id for entry_id in previous_ids
+                       if entry.id in prior_states and prior_states[entry.id] != entry_state(entry)]
+        inactive_ids = [entry_id for entry_id in prior_states
                         if entry_id not in by_id or by_id[entry_id].status != "active"]
         interval_ready = iteration - record.get("last_success_iteration", iteration - 2) >= 2
         eligibility = ""
@@ -365,7 +373,11 @@ def attach_relevant_overviews(tasks: list[dict], entries: list[Entry], state: di
                 overlap = selected & set(record.get("input_ids", []))
                 if overview_id in active_overviews and overview_id not in stale_ids and len(overlap) >= 2:
                     candidates.append((len(overlap), entity_id, overview_id))
-        attached = []
+        attached = [
+            {"overview_id": card["id"], "entity_id": entity_id, "overlap": 0}
+            for entity_id, record in records.items() for card in record.get("cards", [])
+            if card["id"] in existing
+        ]
         for overlap, entity_id, overview_id in sorted(candidates, reverse=True)[:2]:
             if overview_id not in existing:
                 existing.append(overview_id)
@@ -483,6 +495,192 @@ def validate_pointer_cards(value: object, eligible_ids: set[str]) -> list[dict]:
     return cards
 
 
+def render_pointer_card(card: dict) -> str:
+    """Keep worker-visible context tied to current original-card references."""
+    lines = [f"{card['name']} (identity: {', '.join(card['identity_source_ids'])})"]
+    lines.extend(f"- {'[unresolved] ' if fact.get('kind') == 'unresolved' else ''}"
+                 f"{fact['text']} (supports: {', '.join(fact['source_ids'])})"
+                 for fact in card["facts"])
+    if card["candidate_source_ids"]:
+        lines.append("Unassigned candidate pointers: " + ", ".join(card["candidate_source_ids"]))
+    return "\n".join(lines)
+
+
+def sync_overview_references(state: dict, entries: list[Entry],
+                             registered_docs: set[str], iteration: int) -> None:
+    """Update pointer membership and hide facts whose original support is gone."""
+    catalogue = _catalogue_from_state(state)
+    by_id = {entry.id: entry for entry in entries}
+    seen_cards: dict[str, dict] = {}
+    for group_id, record in state.get("overviews", {}).items():
+        current = [entry.id for entry, _ in catalogue.matched_entries(entries, group_id)
+                   if entry.status == "active" and entry.source
+                   and entry.source.document in registered_docs
+                   and _is_qualifying_source(entry, state)]
+        record["pointer_ids"] = current
+        for index, card in enumerate(record.get("cards", [])):
+            if card["id"] in seen_cards:
+                record["cards"][index] = seen_cards[card["id"]]
+                continue
+            seen_cards[card["id"]] = card
+            known = set(card["identity_source_ids"]) | set(card["candidate_source_ids"])
+            # New retrieved cards stay candidates until a delta cites them for this identity.
+            card["candidate_source_ids"] = [i for i in dict.fromkeys(
+                card["candidate_source_ids"] + [i for i in current if i not in known])
+                if i in current and i not in card["identity_source_ids"]]
+            support_states = card.setdefault("support_states", {
+                i: record.get("source_states", {}).get(i, "") for i in card["identity_source_ids"]
+            })
+            valid = {i for i in card["identity_source_ids"]
+                     if i in current and (not support_states.get(i)
+                                          or support_states[i] == entry_state(by_id[i]))}
+            card["identity_source_ids"] = [i for i in card["identity_source_ids"] if i in valid]
+            card["candidate_source_ids"] = [i for i in card["candidate_source_ids"] if i not in valid]
+            retained = []
+            for fact in card["facts"]:
+                old = fact["source_ids"]
+                fact["source_ids"] = [i for i in old if i in valid]
+                if len(old) != len(fact["source_ids"]):
+                    hint = next((i for i in current if i not in valid
+                                 and fact["text"].casefold() in by_id[i].content.casefold()), "")
+                    if not hint:
+                        hint = next((candidate for candidate in current if candidate not in valid
+                                     and any(by_id.get(lost) and by_id[lost].source
+                                             and by_id[candidate].source.document == by_id[lost].source.document
+                                             and by_id[candidate].source.section == by_id[lost].source.section
+                                             for lost in old)), "")
+                    key = (card["id"], fact["text"], tuple(old))
+                    if key not in {(e["key"][0], e["key"][1], tuple(e["key"][2]))
+                                   for e in state.setdefault("reference_errors", [])}:
+                        state["reference_errors"].append({
+                            "key": list(key), "iteration": iteration, "entity_id": card["id"],
+                            "job_kind": "reference_sync", "affected_card_ids": list(set(old) - valid),
+                            "reason": "displayed fact lost original support", "candidate_id": hint,
+                        })
+                    card.setdefault("repair_hints", []).append({
+                        "text": fact["text"], "lost_ids": list(set(old) - valid),
+                        "candidate_id": hint,
+                    })
+                if fact["source_ids"]:
+                    retained.append(fact)
+            card["facts"] = retained
+            entry = by_id.get(card["id"])
+            if entry:
+                entry.status = "active" if card["identity_source_ids"] else "inactive"
+                entry.supports_entries = card["identity_source_ids"][:]
+                entry.content = render_pointer_card(card) if card["identity_source_ids"] else ""
+
+
+def build_delta_prompt(card: dict, source_entries: list[Entry], hints: list[dict]) -> str:
+    originals = "\n".join(f"[{entry.id}] {entry.content}" for entry in source_entries)
+    return f"""Maintain exactly this one identity navigation card. Do not merge similar names.
+Return small supported operations only, not a rewritten card or analysis finding.
+An unassigned candidate is not a confirmed identity source until a cited operation
+supports its assignment. A repair candidate is only a hint, never proven support.
+
+CURRENT CARD: {render_pointer_card(card)}
+CURRENT FACTS (zero-based indices): {[(i, fact) for i, fact in enumerate(card['facts'])]}
+REPAIR / WORKER HINTS: {hints}
+NEW OR CHANGED ORIGINAL CARDS:
+{originals}
+
+Return JSON only: {{"operations": [
+{{"op": "add|replace|remove|flag", "fact_index": 0,
+"text": "short fact for add/replace/flag", "source_ids": ["original ID"]}}
+]}}. Use fact_index only for replace/remove. Each source ID must be in the
+supplied originals or current card's confirmed pointers. Return an empty list
+if evidence does not justify a change."""
+
+
+def apply_delta(card: dict, payload: dict, allowed_ids: set[str],
+                active_entries: dict[str, Entry]) -> dict:
+    """Validate the whole patch before changing supported state."""
+    operations = payload.get("operations")
+    if not isinstance(operations, list):
+        raise ValueError("delta must contain operations array")
+    revised = {**card, "facts": [dict(fact) for fact in card["facts"]],
+               "identity_source_ids": card["identity_source_ids"][:],
+               "candidate_source_ids": card["candidate_source_ids"][:],
+               "repair_hints": []}
+    for op in operations:
+        if not isinstance(op, dict) or op.get("op") not in {"add", "replace", "remove", "flag"}:
+            raise ValueError("unsupported delta operation")
+        kind = op["op"]
+        refs = op.get("source_ids", [])
+        if (not isinstance(refs, list) or not refs
+                or any(not isinstance(i, str) or i not in allowed_ids or i not in active_entries
+                       for i in refs)):
+            raise ValueError("delta operation has unsupported original references")
+        refs = list(dict.fromkeys(refs))
+        if kind in {"replace", "remove"}:
+            index = op.get("fact_index")
+            if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(revised["facts"]):
+                raise ValueError("delta fact index is invalid")
+        if kind == "remove":
+            revised["facts"].pop(index)
+            continue
+        fact_text = op.get("text")
+        if not isinstance(fact_text, str) or not fact_text.strip():
+            raise ValueError("delta fact needs text")
+        fact = {"text": fact_text.strip(), "source_ids": refs}
+        if kind == "flag":
+            fact["kind"] = "unresolved"
+        if kind == "replace":
+            revised["facts"][index] = fact
+        else:
+            revised["facts"].append(fact)
+        # A cited new card becomes confirmed only for this one identity.
+        for entry_id in refs:
+            if entry_id not in revised["identity_source_ids"]:
+                revised["identity_source_ids"].append(entry_id)
+            if entry_id in revised["candidate_source_ids"]:
+                revised["candidate_source_ids"].remove(entry_id)
+    revised["support_states"] = {
+        i: entry_state(active_entries[i]) for i in revised["identity_source_ids"]
+        if i in active_entries
+    }
+    return revised
+
+
+def select_delta_tasks(state: dict, inventory: list[dict], entries: list[Entry]) -> list[dict]:
+    """Choose at most three precise jobs; leave the rest visible as backlog."""
+    by_id = {entry.id: entry for entry in entries if entry.status == "active"}
+    candidates = []
+    seen_cards = set()
+    for item in inventory:
+        group_id = item["entity_id"]
+        record = state.get("overviews", {}).get(group_id, {})
+        for card in record.get("cards", []):
+            if card["id"] in seen_cards:
+                continue
+            seen_cards.add(card["id"])
+            cursor = set(card.get("semantic_input_ids", record.get("input_ids", [])))
+            new_ids = [i for i in item["source_card_ids"] if i not in cursor]
+            changed = [i for i, old in card.get("support_states", {}).items()
+                       if i not in by_id or old != entry_state(by_id[i])]
+            requests = [r for r in state.get("overview_review_requests", [])
+                        if r["overview_id"] == card["id"]]
+            hints = card.get("repair_hints", []) + requests
+            if len(new_ids) < REFRESH_OVERVIEW_CARDS and not changed and not hints:
+                continue
+            signature = sorted(new_ids + changed + [str(h) for h in hints])
+            if signature == card.get("failed_delta_signature"):
+                continue
+            source_ids = list(dict.fromkeys(new_ids + changed + card["identity_source_ids"][:2]
+                                            + [h.get("candidate_id", "") for h in hints]))
+            source_ids = [i for i in source_ids if i in by_id]
+            candidates.append((not bool(hints or changed), -len(new_ids), group_id,
+                               card["id"], {
+                "expected_output_type": "entity_delta", "entity_group_id": group_id,
+                "entity_card_id": card["id"], "entity_delta_source_ids": source_ids,
+                "entity_new_ids": new_ids, "entity_hints": hints,
+                "entity_signature": signature,
+            }))
+    candidates.sort(key=lambda item: item[:4])
+    state["delta_backlog"] = [item[3] for item in candidates[3:]]
+    return [item[4] for item in candidates[:3]]
+
+
 def validate_structured_overview(value: object, eligible_ids: set[str]) -> tuple[dict, list[str]]:
     """Keep valid evidence-linked statements; reject a response with none."""
     if not isinstance(value, dict):
@@ -568,12 +766,7 @@ def run_entity_overview(catalogue: NameCatalogue, entries: list[Entry], entity_i
     cards = validate_pointer_cards(payload.get("cards"), eligible_ids)
     findings = []
     for card in cards:
-        lines = [f"{card['name']} (identity: {', '.join(card['identity_source_ids'])})"]
-        lines.extend(f"- {fact['text']} (supports: {', '.join(fact['source_ids'])})"
-                     for fact in card["facts"])
-        if card["candidate_source_ids"]:
-            lines.append("Unassigned candidate pointers: " + ", ".join(card["candidate_source_ids"]))
-        findings.append({"type": "entity_overview", "content": "\n".join(lines),
+        findings.append({"type": "entity_overview", "content": render_pointer_card(card),
                          "supports_entries": card["identity_source_ids"]})
     output = parse_worker_output({"findings": findings}, iteration, "entity_overview", "entity overview")
     return output, [entry.id for entry, _ in matched], tokens, cards

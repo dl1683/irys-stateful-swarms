@@ -93,7 +93,7 @@ def test_final_iteration_resume_keeps_prior_and_later_usage(tmp_path, monkeypatc
     task, _source, path = _checkpoint(tmp_path, ended=True)
     monkeypatch.setenv("SWARM_FABLE_MODEL", "")
     monkeypatch.setattr(swarm, "run_orchestrator", lambda *_a, **_k: pytest.fail("loop repeated"))
-    monkeypatch.setattr(swarm, "_run_final_overview_pass", lambda *_: None)
+    monkeypatch.setattr(swarm, "_run_due_deltas", lambda *_a, **_k: None)
     monkeypatch.setattr(swarm, "curate_entries", lambda *_: ([], 0))
     monkeypatch.setattr(swarm, "build_synthesis_packet", lambda *_: {})
     monkeypatch.setattr(swarm, "write_synthesis_packet_report", lambda *_: None)
