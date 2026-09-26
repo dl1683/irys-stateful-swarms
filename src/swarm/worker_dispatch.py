@@ -369,7 +369,8 @@ ANALYTICAL_TYPES = {"analysis", "calculation", "strategy"}
 
 def execute_workers_parallel(worker_tasks: list[dict], blackboard: Blackboard,
                              caller: ModelCaller, *,
-                             analytical_caller: ModelCaller | None = None) -> list[WorkerOutput]:
+                             analytical_caller: ModelCaller | None = None,
+                             smart_caller: ModelCaller | None = None) -> list[WorkerOutput]:
     from .source_custody import _valid_document_names
     _valid_docs = _valid_document_names(blackboard)
 
@@ -383,15 +384,18 @@ def execute_workers_parallel(worker_tasks: list[dict], blackboard: Blackboard,
             try:
                 record = blackboard.entity_overview_state.get("overviews", {}).get(entity_id, {})
                 entries, input_ids, tokens, structured = run_entity_overview(
-                    catalogue, blackboard.entries, entity_id, caller, blackboard.iteration,
+                    catalogue, blackboard.entries, entity_id, smart_caller or caller, blackboard.iteration,
                     record.get("structured") if task.get("entity_refresh") else None,
                     record.get("input_ids") if task.get("entity_refresh") else None,
+                    set(task.get("entity_source_ids", [])),
                 )
             except (RuntimeError, ValueError) as exc:
                 # A failed prerequisite is recorded by the loop, not retried forever.
-                return WorkerOutput([], 0, 0, 0, "", wid, {**task, "entity_error": str(exc)}, [])
+                return WorkerOutput([], 0, 0, 0, "", wid, {**task, "entity_error": str(exc),
+                    "entity_caller_fallback": smart_caller is None}, [])
             _, model, t_in, t_out = get_last_call_usage()
-            task = {**task, "entity_input_ids": input_ids, "entity_structured_overview": structured}
+            task = {**task, "entity_input_ids": input_ids, "entity_cards": structured,
+                    "entity_caller_fallback": smart_caller is None}
             return WorkerOutput(entries, tokens, t_in, t_out, model, wid, task, [])
         assigned_ids = _assigned_signal_ids(task, blackboard)
         assigned_signals = _assigned_signal_details(assigned_ids, blackboard)

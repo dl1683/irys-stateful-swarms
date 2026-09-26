@@ -32,7 +32,7 @@ ENTITY OVERVIEW INVENTORY:
 Create 1-5 workers. For each:
 {{"description": "specific task — be precise about what to extract or analyze", "reads_from_blackboard": ["e1"],
   "reads_from_documents": [{{"document": "name", "sections": ["Sec 4"]}}],
-  "expected_output_type": "observation|analysis|calculation|strategy|entity_overview",
+  "expected_output_type": "observation|analysis|calculation|strategy",
   "priority": "critical|high|medium", "addresses_signals": ["s2"],
   "search_queries": ["optional web search queries — use when facts need external verification"]}}
 
@@ -58,8 +58,6 @@ GUIDELINES:
 - EXTRACTION GAPS: If a document has many more items than we've extracted, dispatch targeted re-extraction
 - For a substantive entity-focused task, use an available overview ID in reads_from_blackboard.
 - Consult prior entity findings before assigning a repeat investigation. State whether the repeat checks another source, narrows extraction, resolves a contradiction, or independently verifies a claim. Repeats remain allowed when they can add evidence.
-- When the inventory suggests initial or refresh, you may commission exactly one worker with
-  "expected_output_type": "entity_overview" and "entity_overview_id": its retrieval ID.
 """
 
 
@@ -156,8 +154,7 @@ def run_orchestrator(blackboard: Blackboard, caller: ModelCaller,
     ) or "None"
     overview_text = "\n".join(
         f"- {item['entity_id']}: overview={item['overview_id'] or 'missing'}, "
-        f"matched={len(item['matched_card_ids'])}, new={item['new_card_count']}, "
-        f"suggestion={item['suggestion'] or 'none'}"
+        f"matched={len(item['matched_card_ids'])}"
         for item in (entity_overviews or [])
     ) or "None"
 

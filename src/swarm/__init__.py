@@ -47,7 +47,6 @@ from .synthesis_packet import (
     build_synthesis_packet,
     consolidate_items,
     filter_evidence_entries,
-    project_overview_statements,
     write_synthesis_packet_report,
 )
 from .synthesis import (
@@ -62,8 +61,7 @@ from .worker_dispatch import (
     passes_quality_gate,
 )
 from .entity_overview import (
-    NameCatalogue, attach_relevant_overviews, automatic_overview_tasks, build_overview_prompt,
-    defer_overview_dependent_tasks,
+    attach_relevant_overviews, automatic_overview_tasks,
     discover_pending_names, entry_state,
     overview_inventory, prepare_overview_tasks,
 )
@@ -90,28 +88,29 @@ def _record_entity_discovery_failure(state: dict, iteration: int, error: Excepti
 
 def _prepare_entity_work(blackboard: Blackboard, workers: list[dict], iteration: int,
                          inventory: list[dict]) -> list[dict]:
-    """Use the same request, scheduling, and attachment path in every investigation round."""
+    """Attach current cards without holding up ordinary workers."""
     state = blackboard.entity_overview_state
-    automatic = automatic_overview_tasks(inventory, state, iteration)
     requested = prepare_overview_tasks(workers, inventory, state, iteration)
-    requested = defer_overview_dependent_tasks(requested, inventory, state, iteration)
-    tasks = automatic + requested
-    return attach_relevant_overviews(tasks, blackboard.entries, state)
+    return attach_relevant_overviews(requested, blackboard.entries, state)
+
+
+def _run_initial_overviews(blackboard: Blackboard, caller: ModelCaller,
+                           smart_caller: ModelCaller | None) -> None:
+    """Run eligible creation after readers commit, outside their worker batch."""
+    state = blackboard.entity_overview_state
+    while True:
+        inventory = overview_inventory(state, blackboard.entries, blackboard.iteration)
+        tasks = automatic_overview_tasks(inventory, state, blackboard.iteration)
+        if not tasks:
+            break
+        outputs = execute_workers_parallel(tasks, blackboard, caller, smart_caller=smart_caller)
+        _commit_entity_worker_outputs(blackboard, outputs, caller, blackboard.iteration)
 
 
 def _commit_entity_worker_outputs(blackboard: Blackboard, outputs: list,
                                   caller: ModelCaller, iteration: int) -> int:
     """Publish validated overview state and provenance after a worker batch."""
     state = blackboard.entity_overview_state
-    for output in outputs:
-        if not output.task.get("entity_refresh"):
-            continue
-        previous = state.get("overviews", {}).get(output.task.get("entity_overview_id", ""), {}).get("entry_id", "")
-        overview = next((entry for entry in output.entries if entry.type == "entity_overview"
-                         and passes_quality_gate(entry)), None)
-        if previous and overview:
-            overview.supersedes_entries = [previous]
-
     new_entries = []
     for output in outputs:
         blackboard.add_tokens(output.tokens_used, output.tokens_input, output.tokens_output, output.model)
@@ -127,13 +126,18 @@ def _commit_entity_worker_outputs(blackboard: Blackboard, outputs: list,
     for output in outputs:
         if output.task.get("expected_output_type") != "entity_overview":
             continue
+        if output.task.get("entity_caller_fallback"):
+            state.setdefault("caller_fallbacks", []).append({
+                "iteration": iteration, "entity_id": output.task.get("entity_overview_id"),
+                "reason": "smart caller unavailable",
+            })
         group_ids = output.task.get("entity_overview_group_ids") or [output.task.get("entity_overview_id", "")]
         for field in ("pending", "initial_queue"):
             queue = state.setdefault(field, [])
             queue[:] = [key for key in queue if key not in group_ids]
-        overview = next((entry for entry in new_entries if entry in output.entries
-                         and entry.type == "entity_overview" and entry.status == "active"), None)
-        if not overview:
+        cards = [entry for entry in output.entries if entry in new_entries
+                 and entry.type == "entity_overview" and entry.status == "active"]
+        if not cards or len(cards) != len(output.task.get("entity_cards", [])):
             for group_id in group_ids:
                 if group_id not in state.setdefault("failed", []):
                     state["failed"].append(group_id)
@@ -143,16 +147,12 @@ def _commit_entity_worker_outputs(blackboard: Blackboard, outputs: list,
             })
             continue
         for group_id in group_ids:
-            prior = state.setdefault("overviews", {}).get(group_id, {})
-            old_id = prior.get("entry_id", "")
-            history = list(prior.get("superseded_entry_ids", []))
-            if old_id and old_id != overview.id:
-                history.append(old_id)
-            state["overviews"][group_id] = {
-                "entry_id": overview.id,
-                "superseded_entry_ids": list(dict.fromkeys(history)),
+            state.setdefault("overviews", {})[group_id] = {
+                "entry_id": cards[0].id,
+                "card_ids": [card.id for card in cards],
                 "input_ids": output.task.get("entity_input_ids", []),
-                "structured": output.task.get("entity_structured_overview", {}),
+                "cards": [dict(card, id=entry.id) for card, entry in
+                          zip(output.task["entity_cards"], cards)],
                 "source_states": {
                     entry.id: entry_state(entry) for entry in blackboard.entries
                     if entry.id in output.task.get("entity_input_ids", [])
@@ -193,83 +193,6 @@ def _commit_entity_worker_outputs(blackboard: Blackboard, outputs: list,
         except (ValueError, RuntimeError) as error:
             _record_entity_discovery_failure(state, iteration, error)
     return len(new_entries)
-
-
-def _run_final_overview_pass(blackboard: Blackboard, caller: ModelCaller) -> None:
-    """Attempt each affected report overview once, within remaining token budget."""
-    state = blackboard.entity_overview_state
-    iteration = blackboard.iteration
-    inventory = overview_inventory(state, blackboard.entries, iteration)
-    # Freeze candidates: refresh output may add derived findings, but cannot reopen this pass.
-    candidates = [item for item in inventory if (
-        item["suggestion"] == "initial"
-        or item.get("new_card_count")
-        or item.get("changed_source_ids")
-        or item.get("inactive_support_ids")
-    ) and item["entity_id"] not in state.get("failed", [])
-      and item["entity_id"] not in state.get("pending", [])]
-    covered_groups = set()
-    tasks = []
-    for item in candidates:
-        if item["entity_id"] in covered_groups:
-            continue
-        group_ids = [other["entity_id"] for other in candidates if (
-            other.get("overview_id") == item.get("overview_id") and item.get("overview_id")
-            or other.get("source_card_ids") == item.get("source_card_ids") and item.get("source_card_ids")
-        )]
-        group_ids = group_ids or [item["entity_id"]]
-        covered_groups.update(group_ids)
-        tasks.append({
-            "description": "Final structured entity overview freshness update from original evidence.",
-            "expected_output_type": "entity_overview", "entity_overview_id": item["entity_id"],
-            "entity_overview_group_ids": group_ids,
-            "entity_variants": sorted({name for other in candidates if other["entity_id"] in group_ids
-                                       for name in other["variants"]}),
-            "reads_from_blackboard": [], "reads_from_documents": [], "priority": "high",
-            "automatic_overview": True, "entity_refresh": bool(item.get("overview_id")),
-            "overview_selection_reason": "final changed support" if (
-                item.get("changed_source_ids") or item.get("inactive_support_ids")
-            ) else "final new direct evidence",
-        })
-    state["final_candidates"] = [task["entity_overview_id"] for task in tasks]
-    for start in range(0, len(tasks), 3):
-        batch = []
-        estimated_batch_tokens = 0
-        for offset, task in enumerate(tasks[start:start + 3]):
-            entity_id = task["entity_overview_id"]
-            catalogue = NameCatalogue({entity_id: set(task["entity_variants"])})
-            matched = [(entry, reason) for entry, reason in catalogue.matched_entries(
-                blackboard.entries, entity_id,
-            ) if entry.status == "active" and entry.type != "entity_overview"]
-            prior = state.get("overviews", {}).get(entity_id, {})
-            prompt = build_overview_prompt(
-                entity_id, task["entity_variants"], matched,
-                prior.get("structured") if task["entity_refresh"] else None,
-                prior.get("input_ids") if task["entity_refresh"] else None,
-            )
-            # UTF-8 bytes conservatively bound input tokens; output is capped at 8192.
-            estimated = len(prompt.encode("utf-8")) + 8192
-            if blackboard.token_budget - blackboard.total_tokens_used < estimated_batch_tokens + estimated:
-                state.setdefault("budget_limited", []).extend(
-                    item["entity_overview_id"] for item in tasks[start + offset:]
-                    if item["entity_overview_id"] not in state.get("budget_limited", [])
-                )
-                break
-            batch.append(task)
-            estimated_batch_tokens += estimated
-        if not batch:
-            break
-        state.setdefault("pending", []).extend(task["entity_overview_id"] for task in batch)
-        state.setdefault("selection_log", []).extend({
-            "iteration": iteration, "entity_id": task["entity_overview_id"],
-            "group_ids": task["entity_overview_group_ids"],
-            "reason": task["overview_selection_reason"],
-        } for task in batch)
-        outputs = execute_workers_parallel(batch, blackboard, caller)
-        _commit_entity_worker_outputs(blackboard, outputs, caller, iteration)
-        state.setdefault("final_attempted", []).extend(task["entity_overview_id"] for task in batch)
-        if state.get("budget_limited"):
-            break
 
 
 def _explicit_output_filenames(deliverables_map: dict) -> list[str]:
@@ -335,6 +258,7 @@ def _restore_checkpoint(task: Task, path: Path) -> tuple[Blackboard, dict, list[
 
 def run_swarm(task: Task, caller: ModelCaller, *,
               synthesis_caller: ModelCaller | None = None,
+              smart_caller: ModelCaller | None = None,
               reviewer_caller: ModelCaller | None = None,
               token_budget: int | None = None,
               max_iterations: int | None = None,
@@ -435,6 +359,7 @@ def run_swarm(task: Task, caller: ModelCaller, *,
         except (ValueError, RuntimeError) as error:
             # Keep unprocessed cards pending; later eligible direct work can retry discovery.
             _record_entity_discovery_failure(blackboard.entity_overview_state, 0, error)
+        _run_initial_overviews(blackboard, caller, smart_caller)
 
         # Phase 4: Extraction depth check — auto re-extract under-covered documents
         for doc in blackboard.documents:
@@ -610,6 +535,7 @@ def run_swarm(task: Task, caller: ModelCaller, *,
         outputs = execute_workers_parallel(tasks_list, blackboard, iter_caller)
 
         _entries_per_iter.append(_commit_entity_worker_outputs(blackboard, outputs, iter_caller, iteration))
+        _run_initial_overviews(blackboard, caller, smart_caller)
 
         new_sigs = [
             s for s in blackboard.signals
@@ -672,6 +598,7 @@ def run_swarm(task: Task, caller: ModelCaller, *,
                     continue
                 outputs = execute_workers_parallel(tasks_list, blackboard, loop_caller)
                 _commit_entity_worker_outputs(blackboard, outputs, loop_caller, blackboard.iteration)
+                _run_initial_overviews(blackboard, caller, smart_caller)
             blackboard.save_snapshot(f"post_supervisor_{review_round}")
 
     enforce_source_custody(blackboard, "pre_state_conversion")
@@ -814,10 +741,6 @@ def run_swarm(task: Task, caller: ModelCaller, *,
         contracts_to_signals(contract_items, blackboard)
         obligations.extend(contract_items)
 
-    # The last source-producing stages have finished; refresh once before projection.
-    _run_final_overview_pass(blackboard, loop_caller)
-    blackboard.save_snapshot("post_final_overview_pass")
-
     # Phase 8: Curate + Combine obligations + Synthesize
     must_include, cur_tokens = curate_entries(blackboard, caller)
     blackboard.add_tokens_from_last_call(cur_tokens)
@@ -837,10 +760,6 @@ def run_swarm(task: Task, caller: ModelCaller, *,
                 combined.append(m)
                 seen.add(key)
         must_include = combined
-
-    # Overview records are derived context only. Project their validated statements
-    # onto their original evidence cards before the packet is assembled.
-    must_include.extend(project_overview_statements(blackboard))
 
     deliverables_map = task.metadata.get("deliverables", {})
     artifact_commitments = build_artifact_commitments(blackboard, deliverables_map)

@@ -430,9 +430,11 @@ class Blackboard:
                 "catalogue_groups": len(variants),
                 "catalogue_variants": sum(len(names) for names in variants.values()),
                 "processed_card_count": len(entity_state.get("discovered_card_ids", [])),
-                "overview_count": len(overviews),
+                "overview_count": len({card["id"] for record in overviews.values()
+                                       for card in record.get("cards", [])}) or len(overviews),
                 "overviews": overviews,
                 "usage": entity_state.get("usage", {}),
+                "caller_fallbacks": entity_state.get("caller_fallbacks", []),
                 "recipients": entity_state.get("recipients", []),
                 "recipient_count": len(entity_state.get("recipients", [])),
                 "referencing_recipient_count": sum(

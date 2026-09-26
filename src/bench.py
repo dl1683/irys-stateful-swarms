@@ -166,6 +166,8 @@ class IrysSwarmBackend:
         r_model = os.getenv("SWARM_REVIEWER_MODEL", "gemini-3.5-flash")
 
         worker_caller = GeminiCaller(model=w_model)
+        sm_model = os.getenv("SWARM_SMART_MODEL", "gemini-3.5-flash")
+        smart_caller = GeminiCaller(model=sm_model) if sm_model != w_model else worker_caller
         synthesis_caller = (
             GeminiCaller(model=s_model) if s_model != w_model else worker_caller
         )
@@ -182,6 +184,7 @@ class IrysSwarmBackend:
             try:
                 deliverable, blackboard = run_swarm(
                     task, worker_caller,
+                    smart_caller=smart_caller,
                     synthesis_caller=synthesis_caller,
                     reviewer_caller=reviewer_caller,
                     token_budget=self._token_budget,

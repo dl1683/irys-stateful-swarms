@@ -243,7 +243,7 @@ def overview_inventory(state: dict, entries: list[Entry], iteration: int = 999) 
 
 
 def automatic_overview_tasks(inventory: list[dict], state: dict, iteration: int) -> list[dict]:
-    """Drain initial coverage, then select two evidence refreshes plus one by age."""
+    """Drain initial coverage after ordinary reading; deltas have a separate cadence."""
     pending = state.setdefault("pending", [])
     queue = state.setdefault("initial_queue", [])
     eligible_initial = [item["entity_id"] for item in inventory if item["suggestion"] == "initial"]
@@ -256,44 +256,6 @@ def automatic_overview_tasks(inventory: list[dict], state: dict, iteration: int)
     selected = queue[:INITIAL_OVERVIEW_BATCH_SIZE]
     selection_pool = list(queue)
     reasons = {entity_id: "initial coverage" for entity_id in selected}
-    if not selected:
-        eligible = [item for item in inventory if item["suggestion"] == "refresh"]
-        selection_pool = [item["entity_id"] for item in eligible]
-        def refresh_unit(item: dict) -> tuple:
-            """Treat retrieval groups sharing one overview/evidence set as one update."""
-            if item.get("overview_id"):
-                return ("overview", item["overview_id"])
-            return ("evidence", *item.get("source_card_ids", []))
-
-        ranked = sorted(eligible, key=lambda item: (
-            not bool(item.get("changed_source_ids") or item.get("inactive_support_ids")),
-            -item.get("new_card_count", 0), -item.get("new_worker_count", 0),
-            item["entity_id"],
-        ))
-        evidence = []
-        selected_units = set()
-        for item in ranked:
-            unit = refresh_unit(item)
-            if unit in selected_units:
-                continue
-            evidence.append(item)
-            selected_units.add(unit)
-            if len(evidence) == 2:
-                break
-        selected = [item["entity_id"] for item in evidence]
-        reasons = {
-            item["entity_id"]: (
-                "changed or inactive support" if item.get("changed_source_ids") or item.get("inactive_support_ids")
-                else "new direct evidence"
-            ) for item in evidence
-        }
-        remaining = [item for item in eligible if refresh_unit(item) not in selected_units]
-        if remaining:
-            oldest = min(remaining, key=lambda item: (
-                item.get("last_success_iteration", -1), item["entity_id"],
-            ))
-            selected.append(oldest["entity_id"])
-            reasons[oldest["entity_id"]] = "oldest eligible overview"
     tasks = []
     covered = set()
     for entity_id in selected:
@@ -319,6 +281,7 @@ def automatic_overview_tasks(inventory: list[dict], state: dict, iteration: int)
             "description": "Create or refresh the structured entity overview from matched evidence.",
             "expected_output_type": "entity_overview", "entity_overview_id": entity_id,
             "entity_overview_group_ids": group_ids, "entity_variants": variants,
+            "entity_source_ids": item["source_card_ids"],
             "reads_from_blackboard": [],
             "reads_from_documents": [], "priority": "high", "automatic_overview": True,
             "entity_refresh": item["suggestion"] == "refresh",
@@ -373,7 +336,7 @@ def attach_relevant_overviews(tasks: list[dict], entries: list[Entry], state: di
     }
     records = state.get("overviews", {})
     stale_ids = {
-        record.get("entry_id", "") for record in records.values()
+        card_id for record in records.values() for card_id in record.get("card_ids", [record.get("entry_id", "")])
         if any(
             entry_id not in by_id or by_id[entry_id].status != "active"
             or (entry_id in record.get("source_states", {})
@@ -392,10 +355,16 @@ def attach_relevant_overviews(tasks: list[dict], entries: list[Entry], state: di
             continue
         candidates = []
         for entity_id, record in records.items():
-            overview_id = record.get("entry_id", "")
-            overlap = selected & set(record.get("input_ids", []))
-            if overview_id in active_overviews and overview_id not in stale_ids and len(overlap) >= 2:
-                candidates.append((len(overlap), entity_id, overview_id))
+            for card in record.get("cards", []):
+                overview_id = card["id"]
+                overlap = selected & set(card["identity_source_ids"])
+                if overview_id in active_overviews and overview_id not in stale_ids and overlap:
+                    candidates.append((len(overlap), entity_id, overview_id))
+            if not record.get("cards"):
+                overview_id = record.get("entry_id", "")
+                overlap = selected & set(record.get("input_ids", []))
+                if overview_id in active_overviews and overview_id not in stale_ids and len(overlap) >= 2:
+                    candidates.append((len(overlap), entity_id, overview_id))
         attached = []
         for overlap, entity_id, overview_id in sorted(candidates, reverse=True)[:2]:
             if overview_id not in existing:
@@ -432,34 +401,16 @@ def defer_overview_dependent_tasks(tasks: list[dict], inventory: list[dict], sta
 
 def prepare_overview_tasks(tasks: list[dict], inventory: list[dict], state: dict,
                            iteration: int) -> list[dict]:
-    """Reject unscheduled overview work before it reaches a worker."""
-    inventory_by_id = {item["entity_id"]: item for item in inventory}
+    """Only Python maintenance may create overview work."""
     accepted = []
     for task in tasks:
         if task.get("expected_output_type") != "entity_overview":
             accepted.append(task)
             continue
-        requested_id = task.get("entity_overview_id")
-        entity_id, resolution_error = resolve_overview_request(requested_id, inventory, state)
-        item = inventory_by_id.get(entity_id)
-        if entity_id in state.get("pending", []) and not task.get("automatic_overview"):
-            continue
-        if resolution_error or not item or (not item["suggestion"] and not item.get("matched_card_ids")):
-            state.setdefault("rejected_requests", []).append({
-                "iteration": iteration,
-                "entity_id": requested_id,
-                "reason": resolution_error or "missing or unavailable overview suggestion",
-            })
-            continue
-        task["entity_overview_id"] = entity_id
-        task["entity_variants"] = item["variants"]
-        task["entity_refresh"] = item["suggestion"] == "refresh"
-        if not item["suggestion"]:
-            task["requested_overview"] = True
-        pending = state.setdefault("pending", [])
-        if entity_id not in pending:
-            pending.append(entity_id)
-        accepted.append(task)
+        state.setdefault("rejected_requests", []).append({
+            "iteration": iteration, "entity_id": task.get("entity_overview_id"),
+            "reason": "overview jobs are scheduled only by Python maintenance",
+        })
     return accepted
 
 
@@ -470,46 +421,66 @@ def build_overview_prompt(entity_id: str, names: list[str], matched: list[tuple[
         f"[{entry.id}] match={reason}\nsource={entry.source.document if entry.source else 'none'}\n{entry.content}"
         for entry, reason in matched
     )
-    return f"""Produce a detailed, reusable overview of the target and candidate name variants.
+    return f"""Create compact navigation cards from these original findings.
+The retrieval group may contain different people or companies with similar names.
+Return one card per supported identity. Leave uncertain sources as candidate_source_ids;
+never assign their facts to an identity. Keep original legal forms and spellings.
+Every displayed name and fact must cite original card IDs. Do not infer identity
+from name similarity, shared address, or a screening hit. Do not create analysis findings.
 
-These cards were retrieved broadly for relevance, not because they necessarily
-describe one entity. They may concern one entity under several names, distinct
-entities with similar names, or related entities such as shareholders,
-subsidiaries, counterparties, and screening candidates.
-
-Organize the evidence into distinct entity profiles where supported. Preserve
-uncertainty where identity cannot be established. Explicitly distinguish
-documented aliases, possible name variants, corporate relationships, and
-screening matches. A screening match is not an alias or proof of identity.
-
-Preserve original names, legal forms, jurisdictions, identifiers, and conflicting
-values. Attribute each important fact to its supporting original cards. Do not
-transfer attributes between profiles merely because names resemble each other.
-Keep relevant evidence whose entity assignment remains uncertain in an
-unresolved section.
-
-Combine repetition, retain documented no-match or cleared outcomes separately from
-transaction approval, and do not invent missing values. Keep a document claim, an
-inference, and an unresolved question distinguishable.
-
-TARGET RETRIEVAL ID: {entity_id}
+RETRIEVAL ID: {entity_id}
 CANDIDATE SPELLINGS: {', '.join(names)}
-
-MATCHED ORIGINAL CARDS (all are supplied in full):
+ORIGINAL CARDS:
 {cards}
 
-{("REFRESH: Previous structured state follows. Keep still-supported statements, revise changed evidence, and never treat this state as independent evidence. Newly supplied evidence IDs: " + ", ".join(entry.id for entry, _ in matched if entry.id not in set(previous_input_ids or [])) + "\n" + render_structured_overview(previous_state) if previous_state else "")}
+Return JSON only: {{"cards": [{{"name": "display name",
+"identity_source_ids": ["original ID"], "candidate_source_ids": ["original ID"],
+"facts": [{{"text": "short material fact", "source_ids": ["original ID"]}}],
+"identity_clues": [{{"type": "birth_date|identifier|address|relationship|other",
+"value": "exact source value", "source_ids": ["original ID"]}}]}}]}}.
+Use an empty cards array if no identity is supported."""
 
-Return JSON with a \"findings\" array. Return exactly one finding with
-\"type\": \"entity_overview\" and \"structured_overview\" containing these flexible
-arrays: \"entity_profiles\", \"relationships_and_distinctions\", and
-\"unresolved_or_conflicting_evidence\". Each array item has a \"label\" and a
-\"statements\" array. Each statement has \"text\", \"supports_entries\" (original card
-IDs), and optional \"kind\" (fact, derived, or unresolved). Empty sections are allowed.
-Use a short readable \"content\" summary too. You may additionally return only
-\"analysis\" or \"gap\" findings for new synthesis or actionable unanswered questions.
-Each additional finding must include content and its original supporting card IDs in
-supports_entries. Do not use other finding types. Do not repeat original findings."""
+
+def validate_pointer_cards(value: object, eligible_ids: set[str]) -> list[dict]:
+    """Reject invented references and facts assigned to uncertain candidates."""
+    if not isinstance(value, list):
+        raise ValueError("overview response must contain cards array")
+    cards = []
+    for raw in value:
+        if not isinstance(raw, dict) or not str(raw.get("name", "")).strip():
+            raise ValueError("overview card needs a display name")
+        confirmed = raw.get("identity_source_ids", [])
+        candidates = raw.get("candidate_source_ids", [])
+        if (not isinstance(confirmed, list) or not confirmed
+                or not isinstance(candidates, list)
+                or any(not isinstance(i, str) or i not in eligible_ids for i in confirmed + candidates)):
+            raise ValueError("overview card has invalid original pointers")
+        confirmed = list(dict.fromkeys(confirmed))
+        candidates = [i for i in dict.fromkeys(candidates) if i not in confirmed]
+        facts = []
+        if not isinstance(raw.get("facts", []), list) or not isinstance(raw.get("identity_clues", []), list):
+            raise ValueError("overview facts and identity clues must be arrays")
+        for fact in raw.get("facts", []):
+            if not isinstance(fact, dict) or not str(fact.get("text", "")).strip():
+                raise ValueError("overview fact needs text")
+            refs = fact.get("source_ids", [])
+            if not isinstance(refs, list) or not refs or any(not isinstance(i, str) or i not in confirmed for i in refs):
+                raise ValueError("overview fact needs confirmed original support")
+            facts.append({"text": str(fact["text"]).strip(), "source_ids": list(dict.fromkeys(refs))})
+        clues = []
+        for clue in raw.get("identity_clues", []):
+            if not isinstance(clue, dict) or not str(clue.get("type", "")).strip() or not str(clue.get("value", "")).strip():
+                raise ValueError("identity clue needs type and exact value")
+            refs = clue.get("source_ids", [])
+            if not isinstance(refs, list) or not refs or any(not isinstance(i, str) or i not in confirmed for i in refs):
+                raise ValueError("identity clue needs confirmed original support")
+            clues.append({"type": str(clue["type"]).strip(), "value": str(clue["value"]).strip(),
+                          "source_ids": list(dict.fromkeys(refs))})
+        cards.append({"name": str(raw["name"]).strip(), "identity_source_ids": confirmed,
+                      "candidate_source_ids": candidates, "facts": facts, "identity_clues": clues})
+    if not cards:
+        raise ValueError("overview response has no source-backed identity cards")
+    return cards
 
 
 def validate_structured_overview(value: object, eligible_ids: set[str]) -> tuple[dict, list[str]]:
@@ -581,39 +552,28 @@ def render_structured_overview(structured: dict) -> str:
 def run_entity_overview(catalogue: NameCatalogue, entries: list[Entry], entity_id: str,
                         caller: ModelCaller, iteration: int = 0,
                         previous_state: dict | None = None,
-                        previous_input_ids: list[str] | None = None) -> tuple[list[Entry], list[str], int, dict]:
-    """Build one overview from all matching active original cards."""
+                        previous_input_ids: list[str] | None = None,
+                        eligible_source_ids: set[str] | None = None) -> tuple[list[Entry], list[str], int, list[dict]]:
+    """Build separate source-linked cards from one broad retrieval group."""
     matched = [(entry, reason) for entry, reason in catalogue.matched_entries(entries, entity_id)
-               if entry.status == "active" and entry.type != "entity_overview"]
+               if entry.status == "active" and entry.type != "entity_overview"
+               and (eligible_source_ids is None or entry.id in eligible_source_ids)]
     if not matched:
         return [], [], 0, {}
     payload, tokens = call_model(
         caller,
         build_overview_prompt(entity_id, catalogue.names_for(entity_id), matched, previous_state, previous_input_ids),
     )
-    findings = payload.get("findings", payload.get("value", []))
-    if not isinstance(findings, list):
-        findings = []
-    overview_finding = next((
-        finding for finding in findings
-        if isinstance(finding, dict) and finding.get("type") == "entity_overview"
-    ), None)
     eligible_ids = {entry.id for entry, _ in matched if entry.status == "active" and entry.type != "entity_overview"}
-    structured, referenced_ids = validate_structured_overview(
-        overview_finding.get("structured_overview") if overview_finding else None, eligible_ids,
-    )
-    # Structured output is sufficient; a prose summary must not be a hidden prerequisite.
-    overview_finding["content"] = render_structured_overview(structured)
-    overview_finding["supports_entries"] = referenced_ids
-    allowed = [
-        finding for finding in findings
-        if isinstance(finding, dict)
-        and finding.get("type") in ("entity_overview", "analysis", "gap")
-    ]
-    output = parse_worker_output(
-        {"findings": allowed}, iteration, "entity_overview", "entity overview",
-    )
-    overviews = [entry for entry in output if entry.type == "entity_overview"]
-    if len(overviews) != 1:
-        raise ValueError("entity overview response must contain exactly one entity_overview finding")
-    return output, [entry.id for entry, _ in matched], tokens, structured
+    cards = validate_pointer_cards(payload.get("cards"), eligible_ids)
+    findings = []
+    for card in cards:
+        lines = [f"{card['name']} (identity: {', '.join(card['identity_source_ids'])})"]
+        lines.extend(f"- {fact['text']} (supports: {', '.join(fact['source_ids'])})"
+                     for fact in card["facts"])
+        if card["candidate_source_ids"]:
+            lines.append("Unassigned candidate pointers: " + ", ".join(card["candidate_source_ids"]))
+        findings.append({"type": "entity_overview", "content": "\n".join(lines),
+                         "supports_entries": card["identity_source_ids"]})
+    output = parse_worker_output({"findings": findings}, iteration, "entity_overview", "entity overview")
+    return output, [entry.id for entry, _ in matched], tokens, cards

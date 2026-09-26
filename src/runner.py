@@ -128,6 +128,7 @@ def run_single_task(task_dir: Path, output_dir: Path, *,
         else:
             deliverable, blackboard = run_swarm(
                 task, worker_caller,
+                smart_caller=smart_caller,
                 synthesis_caller=synthesis_caller,
                 reviewer_caller=reviewer_caller,
                 resume_checkpoint=resume_checkpoint,

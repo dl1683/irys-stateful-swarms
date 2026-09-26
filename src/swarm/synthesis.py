@@ -1192,9 +1192,25 @@ def _selected_evidence_text(
     pure_open_issue_ids = open_issue_ids - set(evidence_ids)
 
     by_id = {e.id: e for e in active if e.id}
+    navigation: list[str] = []
+    for overview in active:
+        if overview.type != "entity_overview":
+            continue
+        original_ids = [entry_id for entry_id in overview.supports_entries
+                        if entry_id in by_id and by_id[entry_id].type != "entity_overview"]
+        if not set(original_ids) & set(evidence_ids):
+            continue
+        # Only follow pointers for identities already present in selected items.
+        extra = [entry_id for entry_id in original_ids if entry_id not in evidence_ids][:4]
+        if extra:
+            navigation.append(f"{overview.content.splitlines()[0]} -> {', '.join(extra)}")
+            evidence_ids.extend(extra)
     evidence_entries = [by_id[eid] for eid in evidence_ids if eid in by_id]
 
     parts: list[str] = []
+    if navigation:
+        parts.append("=== ENTITY POINTERS (original entries below are evidence) ===")
+        parts.extend(navigation)
     if evidence_entries:
         parts.append("=== SELECTED ITEM SUPPORTING ENTRIES ===")
         for e in evidence_entries:
@@ -1213,7 +1229,7 @@ def _selected_evidence_text(
     selected_set = set(evidence_ids) | pure_open_issue_ids
     remaining_by_doc: dict[str, list[str]] = {}
     for e in active:
-        if e.id in selected_set:
+        if e.id in selected_set or e.type == "entity_overview":
             continue
         doc = e.source.document if e.source else "cross_cutting"
         remaining_by_doc.setdefault(doc or "cross_cutting", []).append(render_entry(e, max_content=450))
