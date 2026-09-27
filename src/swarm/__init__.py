@@ -298,12 +298,27 @@ def _run_identity_reviews(blackboard: Blackboard, caller: ModelCaller,
                 if outcome == "same":
                     target = apply_identity_merge(state, blackboard.entries, *pair, refs)
                     finding = Entry(id=gen_entry_id(), type="analysis",
-                        content=f"Identity review: overviews {pair[0]} and {pair[1]} identify the same entity; use {target} for lookup.",
+                        content=(f"Identity review: {cards[pair[0]]['name']} ({pair[0]}) and "
+                                 f"{cards[pair[1]]['name']} ({pair[1]}) identify the same entity; "
+                                 f"use {target} for lookup."),
                         supports_entries=refs, epistemic=EpistemicStatus("inference", "unknown", ""),
                         created_by=WorkerRecord("identity_review", "source-grounded duplicate review",
                                                 blackboard.iteration), status="active")
                     blackboard.add_entries_batch([finding])
                     state["identity_history"][-1]["finding_id"] = finding.id
+                elif outcome == "distinct":
+                    finding = Entry(id=gen_entry_id(), type="analysis",
+                        content=(f"Identity review: {cards[pair[0]]['name']} ({pair[0]}) and "
+                                 f"{cards[pair[1]]['name']} ({pair[1]}) identify distinct entities."),
+                        supports_entries=refs, epistemic=EpistemicStatus("inference", "unknown", ""),
+                        created_by=WorkerRecord("identity_review", "source-grounded distinction",
+                                                blackboard.iteration), status="active")
+                    blackboard.add_entries_batch([finding])
+                    for card, other_id in ((cards[pair[0]], pair[1]), (cards[pair[1]], pair[0])):
+                        pointers = card.setdefault("possibly_same_as", [])
+                        pointers[:] = [p for p in pointers if p["overview_id"] != other_id]
+                        pointers.append({"overview_id": other_id, "source_ids": refs,
+                                         "status": "distinct"})
                 elif outcome == "split":
                     split_id = payload["split_overview_id"]
                     from .worker_dispatch import get_last_call_usage, set_last_call_usage
@@ -325,10 +340,6 @@ def _run_identity_reviews(blackboard: Blackboard, caller: ModelCaller,
                         "failed": bool(rebuild_error), "error": rebuild_error[:300]})
                     if rebuild_error:
                         raise ValueError(rebuild_error)
-                for card in (cards[pair[0]], cards[pair[1]]):
-                    for pointer in card.get("possibly_same_as", []):
-                        if pointer["overview_id"] in pair:
-                            pointer["status"] = outcome
             except (ValueError, KeyError, TypeError, RuntimeError) as exc:
                 error = str(exc)
         state.setdefault("identity_reviews", {})[key] = {

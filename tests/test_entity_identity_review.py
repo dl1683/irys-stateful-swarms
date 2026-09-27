@@ -52,31 +52,44 @@ def board(tmp_path, *, names=("Alex Rowan", "Alex Rowan"),
     return result
 
 
-def test_proposal_requires_two_distinct_supported_clues_or_worker_flag(tmp_path):
+def test_conflicting_identity_clue_is_reviewed_but_unrelated_request_is_retired(tmp_path):
     b = board(tmp_path, second_clues=(("birth_date", "2 Feb 1990"), ("address", "8 Oak Road")))
-    assert select_identity_reviews(b.entity_overview_state, b.entries) == []
-    assert not b.entity_overview_state["identity_review_backlog"]
-    b.entity_overview_state["identity_review_requests"] = [
-        {"overview_id": "ov0", "reason": "Identity ambiguity with the other Alex Rowan"}]
     assert len(select_identity_reviews(b.entity_overview_state, b.entries)) == 1
+    unrelated = board(tmp_path, names=("Dmitri Volkov", "Al-Rashidi Family Trust"))
+    unrelated.entity_overview_state["identity_review_requests"] = [
+        {"overview_id": "ov0", "reason": "Trust beneficiaries affect Volkov ownership analysis"}]
+    assert select_identity_reviews(unrelated.entity_overview_state, unrelated.entries) == []
+    assert unrelated.entity_overview_state["identity_request_triage"][0]["status"] == "dismissed"
+    assert "identity_review_requests" not in unrelated.entity_overview_state
 
 
-def test_two_clues_propose_once_and_shared_source_does_not(tmp_path):
+def test_similar_names_without_matching_or_conflicting_clues_do_not_cost_a_call(tmp_path):
+    b = board(tmp_path, second_clues=(("other", "unrelated note"),
+                                       ("relationship", "different counterparty")))
+    b.entity_overview_state["identity_review_requests"] = [
+        {"overview_id": "ov0", "reason": "Identity question about Alex Rowan"}]
+    assert select_identity_reviews(b.entity_overview_state, b.entries) == []
+    assert b.entity_overview_state["identity_request_triage"][0]["status"] == "dismissed"
+
+
+def test_matching_clues_propose_once_and_shared_originals_can_support_review(tmp_path):
     b = board(tmp_path)
     tasks = select_identity_reviews(b.entity_overview_state, b.entries)
     assert len(tasks) == 1
     assert tasks[0]["pair"] == ["ov0", "ov1"]
-    assert b.entity_overview_state["overviews"]["alex"]["cards"][0]["possibly_same_as"][0]["status"] == "pending"
+    assert "possibly_same_as" not in b.entity_overview_state["overviews"]["alex"]["cards"][0]
     shared = board(tmp_path, shared_card=True)
-    assert select_identity_reviews(shared.entity_overview_state, shared.entries) == []
+    assert len(select_identity_reviews(shared.entity_overview_state, shared.entries)) == 1
 
 
-def test_unresolved_is_visible_and_not_repeated_without_new_evidence(tmp_path):
+def test_unresolved_stays_in_working_state_and_is_not_repeated(tmp_path):
     b = board(tmp_path)
     smart = Caller({"outcome": "unresolved", "source_ids": [], "basis": "uncertain"})
     _run_identity_reviews(b, Caller(), smart)
     assert len(smart.prompts) == 1
     assert b.entity_overview_state["identity_reviews"]["ov0|ov1"]["outcome"] == "unresolved"
+    assert not any(e.type == "analysis" for e in b.entries)
+    assert all("Possibly same as" not in e.content for e in b.entries if e.type == "entity_overview")
     _run_identity_reviews(b, Caller(), smart)
     assert len(smart.prompts) == 1
     assert all(e.status == "active" for e in b.entries[-2:])
@@ -117,6 +130,28 @@ def test_shared_identifier_merges_without_copying_facts_and_can_reverse(tmp_path
     assert finding.status == "inactive"
 
 
+def test_invalid_equivalence_quote_can_use_independently_cited_identifier(tmp_path):
+    b = board(tmp_path, clues=(("registration", "CHE-123.456.789"), ("address", "8 Oak Road")))
+    smart = Caller({"outcome": "same", "basis": "explicit_equivalence",
+                    "source_ids": ["s00", "s10"], "evidence_quote": "These are the same company."})
+    _run_identity_reviews(b, Caller(), smart)
+    assert b.entity_overview_state["identity_reviews"]["ov0|ov1"]["outcome"] == "same"
+    assert not b.entity_overview_state["jobs"][-1]["failed"]
+
+
+def test_shared_original_can_support_duplicate_card_review(tmp_path):
+    b = board(tmp_path, clues=(("registration", "CHE-123.456.789"), ("address", "8 Oak Road")))
+    later = b.entity_overview_state["overviews"]["alex"]["cards"][1]
+    later["identity_source_ids"].append("s00")
+    later["identity_clues"][0]["source_ids"] = ["s00"]
+    smart = Caller({"outcome": "same", "basis": "shared_identifier",
+                    "source_ids": ["s00"], "reason": "same registration"})
+    _run_identity_reviews(b, Caller(), smart)
+    assert len(smart.prompts) == 1
+    assert not b.entity_overview_state["jobs"][-1]["failed"]
+    assert later["redirect_to"] == "ov0"
+
+
 def test_conflicting_identifier_rejects_same(tmp_path):
     b = board(tmp_path, clues=(("registration", "CHE-123.456.789"), ("address", "8 Oak Road")),
               second_clues=(("registration", "CHE-987.654.321"), ("address", "8 Oak Road")))
@@ -125,6 +160,20 @@ def test_conflicting_identifier_rejects_same(tmp_path):
     _run_identity_reviews(b, Caller(), smart)
     assert b.entity_overview_state["jobs"][-1]["failed"]
     assert all(e.status == "active" for e in b.entries[-2:])
+
+
+def test_confirmed_distinct_reaches_blackboard_once(tmp_path):
+    b = board(tmp_path, clues=(("registration", "CHE-123.456.789"), ("address", "8 Oak Road")),
+              second_clues=(("registration", "CHE-987.654.321"), ("address", "8 Oak Road")))
+    smart = Caller({"outcome": "distinct", "basis": "difference",
+                    "source_ids": ["s00", "s10"], "reason": "different register numbers"})
+    _run_identity_reviews(b, Caller(), smart)
+    findings = [e for e in b.entries if e.type == "analysis"]
+    assert len(findings) == 1 and "distinct entities" in findings[0].content
+    assert findings[0].supports_entries == ["s00", "s10"]
+    assert all("Reviewed as distinct" in e.content for e in b.entries if e.type == "entity_overview")
+    _run_identity_reviews(b, Caller(), smart)
+    assert len(smart.prompts) == 1
 
 
 def test_confirmed_split_rebuilds_with_smart_caller(tmp_path):

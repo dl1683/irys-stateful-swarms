@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.ingestion import ingest_file
-from src.swarm import _run_final_overview_pass
+from src.swarm import _run_due_deltas
 from src.swarm.blackboard import Blackboard
 from src.swarm.entity_overview import (
     NameCatalogue,
@@ -285,7 +285,7 @@ def _run_final_freshness_checkpoint(args, caller: RecordingCaller | None) -> dic
         task_instruction="Report current personal residency and screening distinctions.",
         entries=entries, iteration=iteration, entity_overview_state=state,
     )
-    _run_final_overview_pass(board, caller)
+    _run_due_deltas(board, caller, final=True)
     packet = build_synthesis_packet(project_overview_statements(board), board)
     new_id = board.entity_overview_state["overviews"][entity_id]["entry_id"]
     subject_rows = [row for row in packet if late_id in row["entry_ids"]

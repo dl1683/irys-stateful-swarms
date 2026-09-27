@@ -81,14 +81,36 @@ def test_initial_identity_cards_attach_and_writers_follow_originals(tmp_path):
     assert "final_attempted" not in board.entity_overview_state
 
 
-def test_pointer_card_rejects_candidate_fact_and_unknown_reference():
+def test_pointer_card_keeps_valid_facts_and_labels_candidate_fact():
     base = {"name": "Alex Rowan", "identity_source_ids": ["src1"],
             "candidate_source_ids": ["src2"], "facts": [], "identity_clues": []}
-    with pytest.raises(ValueError):
-        validate_pointer_cards([dict(base, facts=[{"text": "Candidate date", "source_ids": ["src2"]}])],
-                               {"src1", "src2"})
+    [card] = validate_pointer_cards([dict(base, facts=[
+        {"text": "Supported date", "source_ids": ["src1"]},
+        {"text": "Candidate date", "source_ids": ["src2"]},
+        {"text": "No source", "source_ids": ["invented"]},
+    ])], {"src1", "src2"})
+    assert [fact["text"] for fact in card["facts"]] == ["Supported date"]
+    assert [fact["text"] for fact in card["unverified_facts"]] == ["Candidate date"]
+    assert card["validation_warnings"]
     with pytest.raises(ValueError):
         validate_pointer_cards([dict(base, identity_source_ids=["invented"])], {"src1", "src2"})
+
+
+def test_bad_fact_does_not_discard_other_initial_cards():
+    cards = validate_pointer_cards([
+        {"name": "Alex Rowan", "identity_source_ids": ["src1"],
+         "candidate_source_ids": ["src2"], "facts": [
+             {"text": "Known role", "source_ids": ["src1"]},
+             {"text": "Possible address", "source_ids": ["src2"]},
+             {"text": "Invented citation", "source_ids": ["missing"]}],
+         "identity_clues": []},
+        {"name": "Other Person", "identity_source_ids": ["src3"],
+         "candidate_source_ids": [], "facts": [], "identity_clues": []},
+    ], {"src1", "src2", "src3"})
+    assert len(cards) == 2
+    assert cards[0]["facts"][0]["text"] == "Known role"
+    assert cards[0]["unverified_facts"][0]["text"] == "Possible address"
+    assert "Invented citation" not in str(cards)
 
 
 def test_run_swarm_smoke_saves_cards_and_original_writer_evidence(tmp_path, monkeypatch):

@@ -466,42 +466,67 @@ Use an empty cards array if no identity is supported."""
 
 
 def validate_pointer_cards(value: object, eligible_ids: set[str]) -> list[dict]:
-    """Reject invented references and facts assigned to uncertain candidates."""
+    """Keep sound card portions; label candidate-only claims as unverified."""
     if not isinstance(value, list):
         raise ValueError("overview response must contain cards array")
     cards = []
     for raw in value:
-        if not isinstance(raw, dict) or not str(raw.get("name", "")).strip():
-            raise ValueError("overview card needs a display name")
+        if not isinstance(raw, dict) or not isinstance(raw.get("name"), str) or not raw["name"].strip():
+            continue
         confirmed = raw.get("identity_source_ids", [])
         candidates = raw.get("candidate_source_ids", [])
-        if (not isinstance(confirmed, list) or not confirmed
-                or not isinstance(candidates, list)
-                or any(not isinstance(i, str) or i not in eligible_ids for i in confirmed + candidates)):
-            raise ValueError("overview card has invalid original pointers")
-        confirmed = list(dict.fromkeys(confirmed))
-        candidates = [i for i in dict.fromkeys(candidates) if i not in confirmed]
+        if not isinstance(confirmed, list) or not isinstance(candidates, list):
+            continue
+        warnings = []
+        invalid = [i for i in confirmed + candidates if not isinstance(i, str) or i not in eligible_ids]
+        if invalid:
+            warnings.append("ignored unknown original pointers")
+        confirmed = list(dict.fromkeys(i for i in confirmed if isinstance(i, str) and i in eligible_ids))
+        if not confirmed:
+            continue
+        candidates = [i for i in dict.fromkeys(candidates)
+                      if isinstance(i, str) and i in eligible_ids and i not in confirmed]
         facts = []
-        if not isinstance(raw.get("facts", []), list) or not isinstance(raw.get("identity_clues", []), list):
-            raise ValueError("overview facts and identity clues must be arrays")
-        for fact in raw.get("facts", []):
-            if not isinstance(fact, dict) or not str(fact.get("text", "")).strip():
-                raise ValueError("overview fact needs text")
+        unverified = []
+        raw_facts = raw.get("facts", [])
+        raw_clues = raw.get("identity_clues", [])
+        if not isinstance(raw_facts, list) or not isinstance(raw_clues, list):
+            warnings.append("ignored malformed fact or clue array")
+        for fact in raw_facts if isinstance(raw_facts, list) else []:
+            if not isinstance(fact, dict) or not isinstance(fact.get("text"), str) or not fact["text"].strip():
+                warnings.append("ignored fact without text")
+                continue
             refs = fact.get("source_ids", [])
-            if not isinstance(refs, list) or not refs or any(not isinstance(i, str) or i not in confirmed for i in refs):
-                raise ValueError("overview fact needs confirmed original support")
-            facts.append({"text": str(fact["text"]).strip(), "source_ids": list(dict.fromkeys(refs))})
+            refs = refs if isinstance(refs, list) else []
+            supported = list(dict.fromkeys(i for i in refs if i in confirmed))
+            tentative = list(dict.fromkeys(i for i in refs if i in candidates))
+            if supported:
+                facts.append({"text": str(fact["text"]).strip(), "source_ids": supported})
+            elif tentative:
+                unverified.append({"text": str(fact["text"]).strip(), "source_ids": tentative})
+            else:
+                warnings.append("ignored fact without a usable original pointer")
         clues = []
-        for clue in raw.get("identity_clues", []):
-            if not isinstance(clue, dict) or not str(clue.get("type", "")).strip() or not str(clue.get("value", "")).strip():
-                raise ValueError("identity clue needs type and exact value")
+        for clue in raw_clues if isinstance(raw_clues, list) else []:
+            if (not isinstance(clue, dict) or not isinstance(clue.get("type"), str)
+                    or not clue["type"].strip() or not isinstance(clue.get("value"), str)
+                    or not clue["value"].strip()):
+                warnings.append("ignored malformed identity clue")
+                continue
             refs = clue.get("source_ids", [])
-            if not isinstance(refs, list) or not refs or any(not isinstance(i, str) or i not in confirmed for i in refs):
-                raise ValueError("identity clue needs confirmed original support")
-            clues.append({"type": str(clue["type"]).strip(), "value": str(clue["value"]).strip(),
-                          "source_ids": list(dict.fromkeys(refs))})
+            refs = refs if isinstance(refs, list) else []
+            supported = list(dict.fromkeys(i for i in refs if i in confirmed))
+            tentative = list(dict.fromkeys(i for i in refs if i in candidates))
+            if supported:
+                clues.append({"type": str(clue["type"]).strip(), "value": str(clue["value"]).strip(),
+                              "source_ids": supported})
+            elif tentative:
+                unverified.append({"text": f"{clue['type']}: {clue['value']}", "source_ids": tentative})
+            else:
+                warnings.append("ignored identity clue without a usable original pointer")
         cards.append({"name": str(raw["name"]).strip(), "identity_source_ids": confirmed,
-                      "candidate_source_ids": candidates, "facts": facts, "identity_clues": clues})
+                      "candidate_source_ids": candidates, "facts": facts, "identity_clues": clues,
+                      "unverified_facts": unverified, "validation_warnings": warnings})
     if not cards:
         raise ValueError("overview response has no source-backed identity cards")
     return cards
@@ -513,11 +538,16 @@ def render_pointer_card(card: dict) -> str:
     lines.extend(f"- {'[unresolved] ' if fact.get('kind') == 'unresolved' else ''}"
                  f"{fact['text']} (supports: {', '.join(fact['source_ids'])})"
                  for fact in card["facts"])
+    lines.extend(f"- [unverified identity link] {fact['text']} "
+                 f"(candidate originals: {', '.join(fact['source_ids'])})"
+                 for fact in card.get("unverified_facts", []))
     if card["candidate_source_ids"]:
         lines.append("Unassigned candidate pointers: " + ", ".join(card["candidate_source_ids"]))
     for pointer in card.get("possibly_same_as", []):
-        label = "Reviewed as distinct from" if pointer["status"] == "distinct" else "Possibly same as"
-        lines.append(f"{label} {pointer['overview_id']} (supports: {', '.join(pointer['source_ids'])}; {pointer['status']})")
+        # Pending and unresolved review work stays in state, not worker-visible evidence.
+        if pointer.get("status") == "distinct":
+            lines.append(f"Reviewed as distinct from {pointer['overview_id']} "
+                         f"(supports: {', '.join(pointer['source_ids'])})")
     return "\n".join(lines)
 
 
@@ -599,6 +629,11 @@ def sync_overview_references(state: dict, entries: list[Entry],
                 if fact["source_ids"]:
                     retained.append(fact)
             card["facts"] = retained
+            card["unverified_facts"] = [
+                {**fact, "source_ids": [i for i in fact["source_ids"] if i in current]}
+                for fact in card.get("unverified_facts", [])
+                if any(i in current for i in fact["source_ids"])
+            ]
             entry = by_id.get(card["id"])
             if entry:
                 entry.status = "active" if card["identity_source_ids"] else "inactive"
@@ -731,21 +766,46 @@ def _clue_matches(left: dict, right: dict) -> list[tuple[dict, dict]]:
             if (first["type"].casefold() == second["type"].casefold()
                     and normalize_name(first["value"]) == normalize_name(second["value"])
                     and set(first["source_ids"]) <= set(left["identity_source_ids"])
-                    and set(second["source_ids"]) <= set(right["identity_source_ids"])
-                    and set(first["source_ids"]) - set(second["source_ids"])
-                    and set(second["source_ids"]) - set(first["source_ids"])):
+                    and set(second["source_ids"]) <= set(right["identity_source_ids"])):
                 matches.append((first, second))
     return matches
 
 
+def _identity_conflict(left: dict, right: dict) -> bool:
+    """A cited DOB or identifier disagreement merits review, never an automatic split."""
+    hard_types = {"birth_date", "date_of_birth", "dob", "registration",
+                  "registration_number", "passport", "passport_number", "tax_id", "national_id"}
+    for first in left.get("identity_clues", []):
+        for second in right.get("identity_clues", []):
+            first_type, second_type = first["type"].casefold(), second["type"].casefold()
+            if first_type == second_type == "identifier":
+                # Generic identifier clues may be different schemes (SWIFT vs licence).
+                first_prefix = re.search(r"[a-z]+", first["value"].casefold())
+                second_prefix = re.search(r"[a-z]+", second["value"].casefold())
+                comparable = (first_prefix and second_prefix
+                              and first_prefix.group() == second_prefix.group()
+                              and first_prefix.group() not in {"id", "no", "number"})
+            else:
+                comparable = first_type == second_type and first_type in hard_types
+            if (comparable
+                    and set(first["source_ids"]) <= set(left["identity_source_ids"])
+                    and set(second["source_ids"]) <= set(right["identity_source_ids"])
+                    and normalize_name(first["value"]) != normalize_name(second["value"])):
+                return True
+    return False
+
+
 def select_identity_reviews(state: dict, entries: list[Entry]) -> list[dict]:
-    """Propose only source-backed pairs or a worker-named ambiguity."""
+    """Triage candidate pairs in Python before spending a review call."""
     cards = identity_cards(state)
     active = {e.id: e for e in entries if e.status == "active" and e.type != "entity_overview"}
-    requests = state.get("identity_review_requests", [])
+    requests = state.pop("identity_review_requests", [])
     reviews = state.setdefault("identity_reviews", {})
     proposals = []
     ids = list(cards)
+    review_clues = {"birth_date", "date_of_birth", "dob", "identifier", "registration",
+                    "registration_number", "address", "relationship", "passport",
+                    "passport_number", "tax_id", "national_id"}
     for index, first_id in enumerate(ids):
         first = cards[first_id]
         for second_id in ids[index + 1:]:
@@ -755,31 +815,20 @@ def select_identity_reviews(state: dict, entries: list[Entry]) -> list[dict]:
             pair = sorted((first_id, second_id))
             key = "|".join(pair)
             matches = _clue_matches(first, second)
-            clue_types = {a["type"].casefold() for a, _ in matches}
             similar = SequenceMatcher(None, normalize_name(first["name"]),
                                       normalize_name(second["name"])).ratio() >= 0.92
-            flags = [r for r in requests if r.get("overview_id") in pair and (
-                (second_id if r["overview_id"] == first_id else first_id) in r.get("reason", "")
-                or normalize_name(second["name"] if r["overview_id"] == first_id else first["name"])
-                in normalize_name(r.get("reason", ""))
-                or similar)]
-            if not (similar and len(clue_types) >= 2 or flags):
+            # A name mentioned in a worker's reason can denote ownership, not identity.
+            if not (similar and (any(a["type"].casefold() in review_clues for a, _ in matches)
+                                 or _identity_conflict(first, second))):
                 continue
-            source_ids = list(dict.fromkeys(first["identity_source_ids"] + second["identity_source_ids"]
-                                            + [i for r in flags for i in r.get("source_ids", [])]))
+            source_ids = list(dict.fromkeys(first["identity_source_ids"] + second["identity_source_ids"]))
             source_ids = [i for i in source_ids if i in active]
             signature = sha256("|".join(f"{i}:{entry_state(active[i])}" for i in sorted(source_ids)).encode()).hexdigest()
             if reviews.get(key, {}).get("signature") == signature:
                 continue
-            # The pointer is explicitly provisional and cites original cards from both sides.
-            for card, other in ((first, second), (second, first)):
-                pointers = card.setdefault("possibly_same_as", [])
-                pointers[:] = [p for p in pointers if p["overview_id"] != other["id"]]
-                pointers.append({"overview_id": other["id"], "source_ids": source_ids,
-                                 "status": "pending"})
             proposals.append({"expected_output_type": "entity_identity_review", "pair": pair,
                               "source_ids": source_ids, "signature": signature,
-                              "flagged": bool(flags)})
+                              "flagged": False})
     for request in requests:
         card_id = request.get("overview_id")
         reason = request.get("reason", "").casefold()
@@ -799,6 +848,12 @@ def select_identity_reviews(state: dict, entries: list[Entry]) -> list[dict]:
                           "pair": [card_id, card_id], "source_ids": source_ids,
                           "signature": signature, "flagged": True})
     state["identity_review_backlog"] = [task["pair"] for task in proposals]
+    # Keep requests inspectable without allowing vague text to generate pair reviews.
+    state.setdefault("identity_request_triage", []).extend({
+        **request, "status": "review_candidate" if any(
+            request.get("overview_id") in task["pair"] for task in proposals
+        ) else "dismissed"
+    } for request in requests)
     return proposals
 
 
@@ -812,13 +867,21 @@ identity-specific identifier with no unresolved conflicting identifier. If one
 card conflates separate people, return split with the conflated overview ID.
 Return JSON only: {{"outcome":"same|distinct|unresolved|split",
 "source_ids":["original ID"], "basis":"explicit_equivalence|shared_identifier|difference|conflation|uncertain",
-"evidence_quote":"exact original excerpt for explicit equivalence",
+"evidence_quote":"exact original excerpt for explicit equivalence or distinction",
 "split_overview_id":"overview ID for split only", "reason":"short explanation"}}.
-Use unresolved when the originals do not settle identity.
+For same or distinct, cite originals supporting both cards. Distinct requires
+conflicting identity-specific clues or an original explicitly saying the
+identities are separate. Use unresolved when the originals do not settle identity.
+The source_ids field must contain IDs from ORIGINAL CARDS below, never the
+overview card IDs. For a shared identifier, use basis shared_identifier and
+cite at least one original ID supporting that identifier from each card.
+Only use explicit_equivalence when evidence_quote copies an exact original excerpt.
 
-CARD A [{first['id']}]: {render_pointer_card(first)}
+CARD A [{first['id']}] (overview ID; do not cite): {render_pointer_card(first)}
+VALID ORIGINAL IDS FOR A: {', '.join(first['identity_source_ids'])}
 CLUES A: {first.get('identity_clues', [])}
-CARD B [{second['id']}]: {render_pointer_card(second)}
+CARD B [{second['id']}] (overview ID; do not cite): {render_pointer_card(second)}
+VALID ORIGINAL IDS FOR B: {', '.join(second['identity_source_ids'])}
 CLUES B: {second.get('identity_clues', [])}
 ORIGINAL CARDS:
 {evidence}"""
@@ -838,6 +901,17 @@ def _validated_identity_outcome(payload: dict, first: dict, second: dict,
         if payload.get("basis") != "conflation" or payload.get("split_overview_id") not in {first["id"], second["id"]}:
             raise ValueError("split needs a named conflated overview")
         return outcome, refs
+    if outcome == "distinct":
+        if not (set(refs) & set(first["identity_source_ids"])
+                and set(refs) & set(second["identity_source_ids"])):
+            raise ValueError("distinct conclusion must cite both identities")
+        quote = payload.get("evidence_quote", "")
+        explicit = (isinstance(quote, str) and len(quote.strip()) >= 12
+                    and any(quote.casefold() in originals[i].content.casefold() for i in refs)
+                    and re.search(r"\b(?:distinct|different|separate|not the same)\b", quote, re.I))
+        if payload.get("basis") != "difference" or not (_identity_conflict(first, second) or explicit):
+            raise ValueError("distinct conclusion lacks a sourced identity difference")
+        return outcome, refs
     if outcome != "same":
         return outcome, refs
     if first["id"] == second["id"]:
@@ -847,22 +921,20 @@ def _validated_identity_outcome(payload: dict, first: dict, second: dict,
         raise ValueError("same conclusion must cite both identities")
     identifiers = {"identifier", "registration", "registration_number", "passport", "passport_number",
                    "tax_id", "national_id", "lei", "account_number"}
-    conflict_types = identifiers | {"birth_date", "date_of_birth", "dob"}
-    for a in first.get("identity_clues", []):
-        for b in second.get("identity_clues", []):
-            if (a["type"].casefold() == b["type"].casefold() in conflict_types
-                    and normalize_name(a["value"]) != normalize_name(b["value"])):
-                raise ValueError("conflicting identity-specific identifier")
+    if _identity_conflict(first, second):
+        raise ValueError("conflicting identity-specific identifier")
     basis = payload.get("basis")
     if basis == "explicit_equivalence":
         quote = payload.get("evidence_quote", "")
-        if (not isinstance(quote, str) or len(quote.strip()) < 12
-                or not any(quote.casefold() in originals[i].content.casefold() for i in refs)
-                or not all(normalize_name(card["name"]) in normalize_name(quote)
-                           for card in (first, second))
-                or not re.search(r"\b(?:same|alias|aka|also known as|formerly|identical)\b", quote, re.I)):
-            raise ValueError("explicit equivalence is not present in a cited original")
-    elif basis == "shared_identifier":
+        if (isinstance(quote, str) and len(quote.strip()) >= 12
+                and any(quote.casefold() in originals[i].content.casefold() for i in refs)
+                and all(normalize_name(card["name"]) in normalize_name(quote)
+                        for card in (first, second))
+                and re.search(r"\b(?:same|alias|aka|also known as|formerly|identical)\b", quote, re.I)):
+            return outcome, refs
+        # Ignore an invented quote if the same cited originals independently prove a shared ID.
+        basis = "shared_identifier"
+    if basis == "shared_identifier":
         matches = [(a, b) for a, b in _clue_matches(first, second)
                    if a["type"].casefold() in identifiers
                    and set(a["source_ids"]) & set(refs) and set(b["source_ids"]) & set(refs)

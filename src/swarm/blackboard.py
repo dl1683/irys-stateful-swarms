@@ -443,6 +443,7 @@ class Blackboard:
                 "reference_errors": entity_state.get("reference_errors", []),
                 "overview_review_requests": entity_state.get("overview_review_requests", []),
                 "identity_review_requests": entity_state.get("identity_review_requests", []),
+                "identity_request_triage": entity_state.get("identity_request_triage", []),
                 "identity_reviews": entity_state.get("identity_reviews", {}),
                 "identity_review_backlog": entity_state.get("identity_review_backlog", []),
                 "identity_history": entity_state.get("identity_history", []),
