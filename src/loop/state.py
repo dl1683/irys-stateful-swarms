@@ -716,10 +716,25 @@ class Board:
     def snapshot(self, label: str = "") -> None:
         if not self.output_dir:
             return
-        d = Path(self.output_dir) / "loop"
+        d = (Path(self.output_dir) / "loop").resolve()
         d.mkdir(parents=True, exist_ok=True)
-        suffix = f"_{label}" if label else ""
-        path = d / f"board_iter_{self.iteration}{suffix}.json"
+        if label:
+            # Treat label as a path component to validate traversal under all OS conventions
+            candidate = (d / Path(label)).resolve()
+            try:
+                candidate.relative_to(d)
+            except ValueError:
+                raise ValueError(f"Snapshot path traversal detected: {label!r}")
+            if candidate.parent != d:
+                raise ValueError(f"Snapshot path traversal detected: {label!r}")
+            suffix = f"_{candidate.name}"
+        else:
+            suffix = ""
+        path = (d / f"board_iter_{self.iteration}{suffix}.json").resolve()
+        try:
+            path.relative_to(d)
+        except ValueError:
+            raise ValueError(f"Snapshot path traversal detected: {label!r}")
         data = {
             "schema_version": 2,
             "instruction": self.instruction,
