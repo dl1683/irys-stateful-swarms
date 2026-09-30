@@ -51,7 +51,8 @@ def _generation_metadata(task_data: dict, deliverables: dict) -> dict:
 def run_single_task(task_dir: Path, output_dir: Path, *,
                     worker_model: str | None = None,
                     synthesis_model: str | None = None,
-                    task_id: str | None = None) -> RunResult:
+                    task_id: str | None = None,
+                    resume_checkpoint: Path | None = None) -> RunResult:
     if not task_id:
         task_id = f"{task_dir.parent.name}/{task_dir.name}"
     t0 = time.time()
@@ -115,6 +116,8 @@ def run_single_task(task_dir: Path, output_dir: Path, *,
     )
 
     try:
+        if resume_checkpoint is not None and os.getenv("SWARM_ARCH", "").strip().lower() == "loop":
+            raise ValueError("checkpoint resume supports the traditional swarm only")
         if os.getenv("SWARM_ARCH", "").strip().lower() == "loop":
             from .loop import run_loop
             deliverable, blackboard = run_loop(
@@ -125,11 +128,20 @@ def run_single_task(task_dir: Path, output_dir: Path, *,
         else:
             deliverable, blackboard = run_swarm(
                 task, worker_caller,
+                smart_caller=smart_caller,
                 synthesis_caller=synthesis_caller,
                 reviewer_caller=reviewer_caller,
+                resume_checkpoint=resume_checkpoint,
             )
     except Exception as e:
-        return RunResult(task_id=task_id, error=f"swarm error: {e}")
+        error = f"swarm error: {e}"
+        (out_dir / "status.json").write_text(json.dumps({
+            "task_id": task_id,
+            "status": "failed",
+            "error": error,
+            "wall_clock_seconds": time.time() - t0,
+        }, indent=2), encoding="utf-8")
+        return RunResult(task_id=task_id, error=error)
 
     deliverable_files = _write_deliverables(
         deliverable, deliverables_for_task, output_subdir,

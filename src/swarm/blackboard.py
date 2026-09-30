@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 import re
-from dataclasses import dataclass, field
+import tempfile
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 from .models import (
-    DocumentStatus, Entry, Signal, WorkerRecord,
-    gen_entry_id, gen_signal_id,
+    DocumentStatus, Entry, EntrySource, EpistemicStatus, Signal, WorkerRecord,
+    advance_id_counters, gen_entry_id, gen_signal_id, id_counters,
 )
 
 
@@ -45,9 +48,162 @@ class Blackboard:
     token_budget: int = 3_000_000
     started_at: str = ""
     output_dir: str = ""
+    entity_overview_state: dict = field(default_factory=dict)
+
+    @staticmethod
+    def source_fingerprints(documents: list[DocumentStatus]) -> list[dict]:
+        """Hash original task files, preserving order even when document IDs repeat."""
+        sources = []
+        for doc in documents:
+            if doc.source_path:
+                with open(doc.source_path, "rb") as source:
+                    digest = hashlib.file_digest(source, "sha256").hexdigest()
+            else:
+                digest = hashlib.sha256(doc.text.encode("utf-8")).hexdigest()
+            sources.append({"id": doc.id, "name": doc.name,
+                            "source_path": doc.source_path, "sha256": digest})
+        return sources
+
+    def save_checkpoint(self, seed_plan: dict, entries_per_iteration: list[int],
+                        *, loop_ended: bool) -> Path | None:
+        """Persist the complete durable state after an iteration has finished."""
+        if not self.output_dir:
+            return None
+        if self.iteration < 1:
+            raise ValueError("checkpoint needs a completed iteration")
+        directory = Path(self.output_dir) / "swarm" / "checkpoints"
+        directory.mkdir(parents=True, exist_ok=True)
+        sources = self.source_fingerprints(self.documents)
+        board = {
+            key: getattr(self, key) for key in (
+                "task_instruction", "iteration", "total_tokens_used", "tokens_input",
+                "tokens_output", "cost_by_model", "token_budget", "started_at",
+                "output_dir", "entity_overview_state",
+            )
+        }
+        board["documents"] = [{
+            key: getattr(doc, key) for key in (
+                "id", "name", "size_bytes", "source_path", "headings",
+                "structural_profile", "read_status", "sections_read", "sections_unread",
+            )
+        } | {"was_loaded": doc.is_loaded} for doc in self.documents]
+        board["entries"] = [asdict(entry) for entry in self.entries]
+        board["signals"] = [asdict(signal) for signal in self.signals]
+        counters = id_counters()
+        for kind, items in (("entry", self.entries), ("signal", self.signals)):
+            prefix = "e" if kind == "entry" else "s"
+            counters[kind] = max(counters[kind], *(
+                int(item.id[1:]) for item in items
+                if item.id.startswith(prefix) and item.id[1:].isdigit()
+            ), 0)
+        payload = {
+            "schema_version": 1, "completed_iteration": self.iteration,
+            "loop_ended": loop_ended, "seed_plan": seed_plan,
+            "entries_per_iteration": entries_per_iteration[-2:],
+            "source_fingerprints": sources, "id_counters": counters,
+            "blackboard": board,
+        }
+        path = directory / f"checkpoint_iter_{self.iteration}.json"
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directory,
+                                             prefix=".checkpoint_", delete=False) as stream:
+                temporary = Path(stream.name)
+                json.dump(payload, stream, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        return path
+
+    @classmethod
+    def load_checkpoint(cls, path: Path) -> tuple[Blackboard, dict, list[int], bool, dict]:
+        """Read a complete v1 checkpoint; document text is reattached by the runner."""
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            required = {"schema_version", "completed_iteration", "loop_ended",
+                        "seed_plan", "entries_per_iteration", "source_fingerprints",
+                        "id_counters", "blackboard"}
+            if not isinstance(data, dict) or not required <= data.keys():
+                raise ValueError("incomplete checkpoint")
+            if type(data["schema_version"]) is not int or data["schema_version"] != 1:
+                raise ValueError("unsupported checkpoint version")
+            board_data = data["blackboard"]
+            board_fields = {item.name for item in fields(cls)}
+            if not isinstance(board_data, dict) or not board_fields <= board_data.keys():
+                raise ValueError("incomplete blackboard state")
+            if (type(data["completed_iteration"]) is not int
+                    or data["completed_iteration"] < 1
+                    or board_data["iteration"] != data["completed_iteration"]
+                    or type(data["loop_ended"]) is not bool
+                    or not isinstance(data["seed_plan"], dict)
+                    or not isinstance(data["entries_per_iteration"], list)
+                    or not isinstance(data["source_fingerprints"], list)):
+                raise ValueError("invalid checkpoint metadata")
+            if (len(data["entries_per_iteration"]) > 2
+                    or any(type(count) is not int or count < 0
+                           for count in data["entries_per_iteration"])
+                    or any(type(board_data[key]) is not int or board_data[key] < 0
+                           for key in ("total_tokens_used", "tokens_input",
+                                       "tokens_output", "token_budget"))
+                    or not isinstance(board_data["cost_by_model"], dict)
+                    or any(not isinstance(usage, dict)
+                           or any(type(usage.get(key)) is not int or usage[key] < 0
+                                  for key in ("input", "output", "total", "calls"))
+                           for usage in board_data["cost_by_model"].values())):
+                raise ValueError("invalid checkpoint metering")
+            counters = data["id_counters"]
+            if (not isinstance(counters, dict)
+                    or any(type(counters.get(key)) is not int or counters[key] < 0
+                           for key in ("entry", "signal"))):
+                raise ValueError("invalid checkpoint ID counters")
+            if (not isinstance(board_data["documents"], list)
+                    or not isinstance(board_data["entries"], list)
+                    or not isinstance(board_data["signals"], list)):
+                raise ValueError("invalid checkpoint collections")
+            document_fields = {"id", "name", "size_bytes", "source_path", "headings",
+                               "structural_profile", "read_status", "sections_read",
+                               "sections_unread", "was_loaded"}
+            entry_fields = {item.name for item in fields(Entry)}
+            signal_fields = {item.name for item in fields(Signal)}
+            if (any(not isinstance(doc, dict) or not document_fields <= doc.keys()
+                    or type(doc["was_loaded"]) is not bool
+                    for doc in board_data["documents"])
+                    or any(not isinstance(entry, dict)
+                           or not entry_fields <= entry.keys()
+                           for entry in board_data["entries"])
+                    or any(not isinstance(signal, dict)
+                           or not signal_fields <= signal.keys()
+                           for signal in board_data["signals"])):
+                raise ValueError("incomplete checkpoint records")
+            board = cls(**{key: board_data[key] for key in board_fields
+                           if key not in ("documents", "entries", "signals")})
+            board.documents = []
+            for doc in board_data["documents"]:
+                restored = DocumentStatus(**{key: value for key, value in doc.items()
+                                             if key != "was_loaded"})
+                restored._checkpoint_was_loaded = doc["was_loaded"]
+                board.documents.append(restored)
+            board.entries = [Entry(
+                **{**entry,
+                   "source": EntrySource(**entry["source"]) if entry["source"] else None,
+                   "epistemic": EpistemicStatus(**entry["epistemic"]) if entry["epistemic"] else None,
+                   "created_by": WorkerRecord(**entry["created_by"])}
+            ) for entry in board_data["entries"]]
+            board.signals = [Signal(**signal) for signal in board_data["signals"]]
+            board._entry_index = {entry.id: entry for entry in board.entries if entry.id}
+            advance_id_counters(counters["entry"], counters["signal"])
+            return (board, data["seed_plan"], data["entries_per_iteration"],
+                    data["loop_ended"], data["source_fingerprints"])
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, AttributeError) as error:
+            raise ValueError(f"invalid checkpoint: {error}") from error
 
     def add_tokens_from_last_call(self, tokens: int) -> None:
         """Add tokens and grab model info from the last call_model invocation."""
+        if tokens <= 0:
+            return
         from .worker_dispatch import get_last_call_usage
         by_model, model, t_in, t_out = get_last_call_usage()
         if isinstance(by_model, dict) and by_model:
@@ -262,5 +418,58 @@ class Blackboard:
             "iteration": self.iteration,
             "total_tokens_used": self.total_tokens_used,
             "token_budget": self.token_budget,
+            "entity_overview_state": self.entity_overview_state,
         }
         path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+        # Keep a stable, small summary beside snapshots so capped runs are inspectable.
+        entity_state = self.entity_overview_state
+        if entity_state:
+            from .entity_overview import overview_inventory
+            inventory = overview_inventory(entity_state, self.entries, self.iteration)
+            variants = entity_state.get("variants", {})
+            overviews = entity_state.get("overviews", {})
+            report = {
+                "catalogue_groups": len(variants),
+                "catalogue_variants": sum(len(names) for names in variants.values()),
+                "processed_card_count": len(entity_state.get("discovered_card_ids", [])),
+                "overview_count": len({card["id"] for record in overviews.values()
+                                       for card in record.get("cards", [])}) or len(overviews),
+                "overviews": overviews,
+                "usage": entity_state.get("usage", {}),
+                "jobs": entity_state.get("jobs", []),
+                "document_rounds": entity_state.get("document_rounds", 0),
+                "delta_backlog": entity_state.get("delta_backlog", []),
+                "delta_errors": entity_state.get("delta_errors", []),
+                "reference_errors": entity_state.get("reference_errors", []),
+                "overview_review_requests": entity_state.get("overview_review_requests", []),
+                "identity_review_requests": entity_state.get("identity_review_requests", []),
+                "identity_request_triage": entity_state.get("identity_request_triage", []),
+                "identity_reviews": entity_state.get("identity_reviews", {}),
+                "identity_review_backlog": entity_state.get("identity_review_backlog", []),
+                "identity_history": entity_state.get("identity_history", []),
+                "caller_fallbacks": entity_state.get("caller_fallbacks", []),
+                "recipients": entity_state.get("recipients", []),
+                "recipient_count": len(entity_state.get("recipients", [])),
+                "referencing_recipient_count": sum(
+                    bool(item.get("referenced_overview_ids"))
+                    for item in entity_state.get("recipients", [])
+                ),
+                "failed": entity_state.get("failed", []),
+                "initial_backlog": entity_state.get("initial_queue", []),
+                "eligible_initial_backlog": [item["entity_id"] for item in inventory
+                                             if item["eligibility"] == "initial"],
+                "eligible_refresh_backlog": [item["entity_id"] for item in inventory
+                                             if item["eligibility"] == "refresh"],
+                "scheduled": entity_state.get("pending", []),
+                "budget_limited": entity_state.get("budget_limited", []),
+                "freshness_failures": entity_state.get("freshness_failures", []),
+                "final_candidates": entity_state.get("final_candidates", []),
+                "final_attempted": entity_state.get("final_attempted", []),
+                "selection_log": entity_state.get("selection_log", []),
+                "deferred": entity_state.get("deferred", []),
+                "rejected_requests": entity_state.get("rejected_requests", []),
+                "discovery_failures": entity_state.get("discovery_failures", []),
+            }
+            (snapshot_dir / "entity_overview_report.json").write_text(
+                json.dumps(report, indent=2, default=str), encoding="utf-8",
+            )

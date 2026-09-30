@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import queue
+import math
+import re
 import threading
 import time
 
@@ -9,6 +11,49 @@ from google import genai
 from google.genai import types as genai_types
 
 from ..swarm.models import ModelCaller, ModelResult
+
+
+class _RequestLimiter:
+    """Space requests across all Gemini callers in this process."""
+
+    def __init__(self, requests_per_minute: int, max_requests: int = 0):
+        if requests_per_minute <= 0:
+            raise ValueError("requests_per_minute must be positive")
+        self.interval = 60 / requests_per_minute
+        self.next_request = 0.0
+        self.max_requests = max_requests
+        self.request_count = 0
+        self.lock = threading.Lock()
+
+    def wait(self) -> None:
+        with self.lock:
+            if self.max_requests and self.request_count >= self.max_requests:
+                raise RuntimeError(
+                    f"Gemini request cap reached ({self.max_requests} requests)"
+                )
+            now = time.monotonic()
+            start = max(now, self.next_request)
+            self.next_request = start + self.interval
+            self.request_count += 1
+        if delay := start - now:
+            time.sleep(delay)
+
+
+# Shared across callers and worker threads in this process.
+# ponytail: process-global lock; use a shared store only for multi-process runs.
+_GEMINI_LIMITER = _RequestLimiter(
+    int(os.environ.get("GEMINI_REQUESTS_PER_MINUTE", "10")),
+    int(os.environ.get("GEMINI_MAX_REQUESTS", "0")),
+)
+
+
+def _retry_delay(error: Exception, attempt: int) -> int:
+    if configured := os.environ.get("GEMINI_RETRY_DELAY_SECONDS"):
+        return max(1, math.ceil(float(configured)))
+    match = re.search(r"retry in\s+([0-9]+(?:\.[0-9]+)?)s", str(error), re.IGNORECASE)
+    if match:
+        return max(1, math.ceil(float(match.group(1))))
+    return min(60, 5 * (2 ** attempt))
 
 
 class GeminiCaller:
@@ -26,6 +71,11 @@ class GeminiCaller:
             if key else genai.Client(http_options=http_options)
         )
         self.model = model
+
+    @property
+    def provider_request_count(self) -> int:
+        """Expose this process's request count for bounded live experiments."""
+        return _GEMINI_LIMITER.request_count
 
     def _generate_content_with_timeout(
         self,
@@ -73,6 +123,7 @@ class GeminiCaller:
         for attempt in range(5):
             t0 = time.perf_counter()
             try:
+                _GEMINI_LIMITER.wait()
                 response = self._generate_content_with_timeout(prompt, config)
             except TimeoutError as e:
                 last_err = e
@@ -100,7 +151,7 @@ class GeminiCaller:
                         "timeout",
                     )
                 ):
-                    wait = min(60, 5 * (2 ** attempt))
+                    wait = _retry_delay(e, attempt)
                     time.sleep(wait)
                     last_err = e
                     continue

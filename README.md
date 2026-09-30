@@ -501,6 +501,17 @@ A production stateful swarm combines coordination (irys-stateful-swarms) with im
 
 ---
 
+## Resume a traditional swarm run
+
+Traditional-swarm runs save `swarm/checkpoints/checkpoint_iter_<n>.json` after each completed iteration. Resume with the same task and output directory:
+
+```bash
+python -m src.cli run <task_directory> --output results/ \
+  --resume results/<task_id>/swarm/checkpoints/checkpoint_iter_<n>.json
+```
+
+Resume verifies the task instruction and original source files before making model calls. Work in an unfinished iteration repeats from the previous completed checkpoint; review and synthesis restart after a final-iteration checkpoint.
+
 ## Other evaluations
 
 The stateful swarm paradigm is not legal-specific. Task decomposition, persistent blackboard state-building, and multi-agent coordination with typed provenance apply to any domain where professionals build understanding through analysis of complex documents.

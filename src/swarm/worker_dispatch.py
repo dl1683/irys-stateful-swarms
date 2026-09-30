@@ -62,6 +62,7 @@ def call_model(caller: ModelCaller, prompt: str, *,
     _usage_state.last_model = result.model
     _usage_state.last_in = result.tokens_input
     _usage_state.last_out = result.tokens_output
+    _usage_state.last_provider_attempts = getattr(result, "provider_attempts", 1)
     _usage_state.last_by_model = by_model
     _record_aggregate_usage(result)
     text = result.text.strip()
@@ -99,6 +100,10 @@ def get_last_call_usage() -> tuple[dict, str, int, int]:
         getattr(_usage_state, "last_in", 0),
         getattr(_usage_state, "last_out", 0),
     )
+
+
+def get_last_provider_attempts() -> int:
+    return getattr(_usage_state, "last_provider_attempts", 1)
 
 
 def set_last_call_usage(by_model: dict | None) -> None:
@@ -165,7 +170,7 @@ def compose_worker_prompt(task_description: str, context_entries: list[Entry],
                 warning = f" [CAUTION: {entry.epistemic.classification}]"
             parts.append(
                 f"  [{entry.id}] ({entry.type}, conf={entry.confidence:.1f}) "
-                f"{entry.content[:300]}{warning}"
+                f"{entry.content if entry.type == 'entity_overview' else entry.content[:300]}{warning}"
             )
 
     if assigned_signals:
@@ -207,6 +212,8 @@ RULES:
 - Every dollar amount, date, deadline, party name, defined term = separate finding
 - Every numbered clause, schedule item, exhibit entry = separate finding
 - Reference prior findings by ID when supporting or contradicting
+- An entity overview is derived context, never a source document. Use its original
+  supports_entries IDs; set source_document to null unless you directly read a listed document.
 - Flag adversarial sources
 - Max 5 opens_questions per finding
 - If you cannot determine something, return type "gap"
@@ -269,7 +276,8 @@ def _attach_assigned_signal_ids(entries: list[Entry], signal_ids: list[str]) -> 
 def parse_worker_output(payload: dict, iteration: int,
                         worker_id: str, task_description: str,
                         valid_doc_names: set[str] | None = None) -> list[Entry]:
-    findings = payload.get("findings", [])
+    # call_model wraps a valid top-level JSON array under "value".
+    findings = payload.get("findings", payload.get("value", []))
     entries = []
     for f in findings:
         if not isinstance(f, dict):
@@ -279,7 +287,8 @@ def parse_worker_output(payload: dict, iteration: int,
             continue
         entry_type = f.get("type", "observation")
         if entry_type not in (
-            "observation", "analysis", "calculation", "strategy", "contradiction", "gap"
+            "observation", "analysis", "calculation", "strategy", "contradiction", "gap",
+            "entity_overview",
         ):
             entry_type = "observation"
 
@@ -365,12 +374,73 @@ ANALYTICAL_TYPES = {"analysis", "calculation", "strategy"}
 
 def execute_workers_parallel(worker_tasks: list[dict], blackboard: Blackboard,
                              caller: ModelCaller, *,
-                             analytical_caller: ModelCaller | None = None) -> list[WorkerOutput]:
+                             analytical_caller: ModelCaller | None = None,
+                             smart_caller: ModelCaller | None = None) -> list[WorkerOutput]:
     from .source_custody import _valid_document_names
     _valid_docs = _valid_document_names(blackboard)
 
     def run_one(task: dict) -> WorkerOutput:
         wid = f"w{blackboard.iteration}_{uuid.uuid4().hex[:4]}"
+        if task.get("expected_output_type") == "entity_identity_review":
+            from .entity_overview import build_identity_review_prompt, identity_cards
+            cards = identity_cards(blackboard.entity_overview_state)
+            first, second = (cards[i] for i in task["pair"])
+            originals = blackboard.get_entries_by_ids(task["source_ids"])
+            set_last_call_usage(None)
+            try:
+                payload, tokens = call_model(smart_caller or caller,
+                    build_identity_review_prompt(first, second, originals), max_tokens=2048)
+                _, model, t_in, t_out = get_last_call_usage()
+                return WorkerOutput([], tokens, t_in, t_out, model, wid,
+                    {**task, "identity_payload": payload, "entity_caller_fallback": smart_caller is None,
+                     "provider_attempts": get_last_provider_attempts()}, [])
+            except Exception as exc:
+                _, model, t_in, t_out = get_last_call_usage()
+                return WorkerOutput([], t_in + t_out, t_in, t_out, model, wid,
+                    {**task, "entity_error": str(exc), "entity_caller_fallback": smart_caller is None,
+                     "provider_attempts": get_last_provider_attempts() if model else None}, [])
+        if task.get("expected_output_type") == "entity_delta":
+            from .entity_overview import build_delta_prompt
+            record = blackboard.entity_overview_state.get("overviews", {}).get(task.get("entity_group_id"), {})
+            card = next((item for item in record.get("cards", []) if item["id"] == task.get("entity_card_id")), None)
+            if card is None:
+                return WorkerOutput([], 0, 0, 0, "", wid, {**task, "entity_error": "missing delta card"}, [])
+            sources = blackboard.get_entries_by_ids(task.get("entity_delta_source_ids", []))
+            try:
+                payload, tokens = call_model(caller, build_delta_prompt(card, sources, task.get("entity_hints", [])),
+                                             max_tokens=2048)
+                _, model, t_in, t_out = get_last_call_usage()
+                task = {**task, "entity_delta_payload": payload,
+                        "provider_attempts": get_last_provider_attempts()}
+                return WorkerOutput([], tokens, t_in, t_out, model, wid, task, [])
+            except Exception as exc:
+                return WorkerOutput([], 0, 0, 0, "", wid, {**task, "entity_error": str(exc)}, [])
+        if task.get("expected_output_type") == "entity_overview":
+            from .entity_overview import NameCatalogue, run_entity_overview
+            entity_id = str(task.get("entity_overview_id", ""))
+            variants = task.get("entity_variants", [])
+            catalogue = NameCatalogue({entity_id: set(variants)})
+            set_last_call_usage(None)
+            try:
+                record = blackboard.entity_overview_state.get("overviews", {}).get(entity_id, {})
+                entries, input_ids, tokens, structured = run_entity_overview(
+                    catalogue, blackboard.entries, entity_id, smart_caller or caller, blackboard.iteration,
+                    record.get("structured") if task.get("entity_refresh") else None,
+                    record.get("input_ids") if task.get("entity_refresh") else None,
+                    set(task.get("entity_source_ids", [])),
+                )
+            except (RuntimeError, ValueError) as exc:
+                # A failed prerequisite is recorded by the loop, not retried forever.
+                _, model, t_in, t_out = get_last_call_usage()
+                return WorkerOutput([], t_in + t_out, t_in, t_out, model, wid,
+                    {**task, "entity_error": str(exc),
+                     "entity_caller_fallback": smart_caller is None,
+                     "provider_attempts": get_last_provider_attempts() if model else None}, [])
+            _, model, t_in, t_out = get_last_call_usage()
+            task = {**task, "entity_input_ids": input_ids, "entity_cards": structured,
+                    "entity_caller_fallback": smart_caller is None,
+                    "provider_attempts": get_last_provider_attempts()}
+            return WorkerOutput(entries, tokens, t_in, t_out, model, wid, task, [])
         assigned_ids = _assigned_signal_ids(task, blackboard)
         assigned_signals = _assigned_signal_details(assigned_ids, blackboard)
         context_entries = blackboard.get_entries_by_ids(
@@ -421,6 +491,13 @@ def execute_workers_parallel(worker_tasks: list[dict], blackboard: Blackboard,
             doc_sections, blackboard.task_instruction, assigned_signals,
             web_search_results=web_results,
         )
+        attached_ids = [item["overview_id"] for item in task.get("entity_overview_attachments", [])]
+        if attached_ids:
+            prompt += ("\nIf new evidence exposes an identity ambiguity or material error on an "
+                       "attached overview, optionally return top-level "
+                       "overview_review_requests: [{overview_id, reason}]. "
+                       f"Only these IDs are attached: {', '.join(attached_ids)}. "
+                       "Put the underlying evidence in ordinary findings.")
         # Route analytical workers to smarter model if available
         expected_type = task.get("expected_output_type", "observation")
         use_caller = caller
@@ -439,6 +516,8 @@ def execute_workers_parallel(worker_tasks: list[dict], blackboard: Blackboard,
             valid_doc_names=_valid_docs,
         )
         _attach_assigned_signal_ids(entries, assigned_ids)
+        if attached_ids and isinstance(payload.get("overview_review_requests"), list):
+            task = {**task, "overview_review_requests": payload["overview_review_requests"]}
         return WorkerOutput(entries, tokens, t_in, t_out, result.model, wid, task, sections_read)
 
     if not worker_tasks:

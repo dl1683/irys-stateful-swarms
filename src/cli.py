@@ -68,6 +68,8 @@ def main():
                        help="Output directory")
     run_p.add_argument("--worker-model", default=None)
     run_p.add_argument("--synthesis-model", default=None)
+    run_p.add_argument("--resume", type=Path, default=None,
+                       help="Resume the traditional swarm from an explicit checkpoint")
 
     # Batch from manifest
     batch_p = sub.add_parser("batch", help="Run batch from manifest")
@@ -293,6 +295,7 @@ def _cmd_run(args):
         args.task_dir, args.output,
         worker_model=args.worker_model,
         synthesis_model=args.synthesis_model,
+        resume_checkpoint=args.resume,
     )
     if result.error:
         print(f"FAILED: {result.error}")

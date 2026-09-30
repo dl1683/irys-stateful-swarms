@@ -33,6 +33,19 @@ def reset_id_counters() -> None:
         _signal_counter = 0
 
 
+def id_counters() -> dict[str, int]:
+    with _id_lock:
+        return {"entry": _entry_counter, "signal": _signal_counter}
+
+
+def advance_id_counters(entry: int, signal: int) -> None:
+    """Keep generated IDs above every ID in a restored board."""
+    global _entry_counter, _signal_counter
+    with _id_lock:
+        _entry_counter = max(_entry_counter, entry)
+        _signal_counter = max(_signal_counter, signal)
+
+
 # --- Model Interface ---
 
 @dataclass

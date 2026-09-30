@@ -24,7 +24,10 @@ def build_synthesis_obligations(blackboard: Blackboard, seed: dict,
 
     Returns (obligations, tokens_used).
     """
-    active = [e for e in blackboard.entries if e.status == "active"]
+    active = [
+        e for e in blackboard.entries
+        if e.status == "active" and e.type != "entity_overview"
+    ]
 
     # Use ALL active entries — not just analytical. Raw observations contain
     # facts that need to become explicit obligations (issue flags, conclusions).

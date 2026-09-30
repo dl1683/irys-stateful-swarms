@@ -9,6 +9,73 @@ from .models import Entry
 
 EVIDENCE_TYPES = frozenset({"observation", "analysis", "calculation"})
 OPEN_ISSUE_TYPES = frozenset({"strategy", "gap"})
+OVERVIEW_PROJECTION_SOURCE = "entity_overview_projection"
+_OVERVIEW_SECTION_NAMES = {
+    "entity_profiles": "Entity Profiles",
+    "relationships_and_distinctions": "Entity Relationships and Distinctions",
+    "unresolved_or_conflicting_evidence": "Open Issues",
+}
+
+
+def project_overview_statements(blackboard: Blackboard) -> list[dict]:
+    """Turn validated overview statements into evidence-linked packet inputs.
+
+    The overview Entry is derived context, so its ID is retained only as lineage.
+    The resulting rows cite the original cards named by each statement instead.
+    """
+    active_original_ids = {
+        entry.id for entry in blackboard.entries
+        if entry.status == "active" and entry.type != "entity_overview"
+    }
+    projected: list[dict] = []
+    seen_overview_ids: set[str] = set()
+
+    for record in blackboard.entity_overview_state.get("overviews", {}).values():
+        if not isinstance(record, dict):
+            continue
+        overview_id = str(record.get("entry_id", "")).strip()
+        if not overview_id or overview_id in seen_overview_ids:
+            continue
+        seen_overview_ids.add(overview_id)
+
+        structured = record.get("structured", {})
+        if not isinstance(structured, dict):
+            continue
+        for section_key, section_name in _OVERVIEW_SECTION_NAMES.items():
+            groups = structured.get(section_key, [])
+            if not isinstance(groups, list):
+                continue
+            for group in groups:
+                if not isinstance(group, dict) or not isinstance(group.get("statements"), list):
+                    continue
+                label = str(group.get("label", "")).strip() or "Unlabelled entity profile"
+                for statement in group["statements"]:
+                    if not isinstance(statement, dict):
+                        continue
+                    summary = str(statement.get("text", "")).strip()
+                    supports = statement.get("supports_entries", [])
+                    if not summary or not isinstance(supports, list):
+                        continue
+                    entry_ids = list(dict.fromkeys(
+                        entry_id for entry_id in supports
+                        if isinstance(entry_id, str) and entry_id in active_original_ids
+                    ))
+                    # Partial support loss can make an old assertion false; retain
+                    # the original cards elsewhere, but do not project that claim.
+                    if not entry_ids or len(entry_ids) != len(set(supports)):
+                        continue
+                    kind = str(statement.get("kind", "fact")).lower()
+                    projected.append({
+                        "entry_ids": entry_ids,
+                        "summary": summary,
+                        "section": section_name,
+                        "importance": "high" if kind == "unresolved" else "medium",
+                        "source": OVERVIEW_PROJECTION_SOURCE,
+                        "overview_kind": "unresolved" if section_key == "unresolved_or_conflicting_evidence" else kind,
+                        "overview_group_label": label,
+                        "overview_lineage": [overview_id],
+                    })
+    return projected
 
 
 def build_synthesis_packet(
@@ -20,7 +87,7 @@ def build_synthesis_packet(
     Strategy/gap entries are marked open_issue_only=True so synthesis
     renders them as explicit open issues rather than asserting them as facts.
     """
-    by_id = {e.id: e for e in blackboard.entries}
+    by_id = {e.id: e for e in blackboard.entries if e.type != "entity_overview"}
     packet: list[dict] = []
     seen_keys: set[str] = set()
 
@@ -51,10 +118,10 @@ def _normalize_item(item: dict, by_id: dict[str, Entry]) -> dict:
             if ref not in source_refs:
                 source_refs.append(ref)
 
-    open_issue_only = False
-    if entries:
+    open_issue_only = item.get("overview_kind") == "unresolved"
+    if entries and not open_issue_only:
         open_issue_only = all(e.type in OPEN_ISSUE_TYPES for e in entries)
-    elif entry_ids:
+    elif entry_ids and not open_issue_only:
         # All referenced entries missing from blackboard — treat as ungrounded
         open_issue_only = True
     elif item.get("source") == "artifact_contract":
@@ -75,6 +142,9 @@ def _normalize_item(item: dict, by_id: dict[str, Entry]) -> dict:
         "artifact_function": item.get("artifact_function", ""),
         "satisfaction_conditions": item.get("satisfaction_conditions", []),
         "evidence_entry_ids": item.get("evidence_entry_ids", []),
+        "overview_kind": item.get("overview_kind", ""),
+        "overview_group_label": item.get("overview_group_label", ""),
+        "overview_lineage": item.get("overview_lineage", []),
     }
 
 
@@ -133,7 +203,7 @@ def filter_evidence_entries(
     by_id = {e.id: e for e in active}
     evidence_entries = [
         e for e in active
-        if e.id not in pure_open_issue_ids
+        if e.type != "entity_overview" and e.id not in pure_open_issue_ids
     ]
 
     return evidence_entries, open_issue_items
@@ -207,12 +277,17 @@ def consolidate_items(items: list[dict], similarity_threshold: float = 0.85) -> 
     Includes a regression guard: if consolidation drops more than 30% of total
     items or 20% of critical/high items, the original list is returned unchanged.
     """
+    # A projected overview may intentionally retain closely worded but distinct
+    # attributes or conflicts.  Its original-card references must stay separate.
+    protected = [item for item in items if item.get("source") == OVERVIEW_PROJECTION_SOURCE]
     by_partition: dict[str, list[dict]] = {}
     for item in items:
+        if item.get("source") == OVERVIEW_PROJECTION_SOURCE:
+            continue
         key = _partition_key(item)
         by_partition.setdefault(key, []).append(item)
 
-    result = []
+    result = list(protected)
     for _key, group in by_partition.items():
         group.sort(key=lambda x: len(x.get("summary", "")), reverse=True)
         fingerprints = [_significant_words(item.get("summary", "")) for item in group]

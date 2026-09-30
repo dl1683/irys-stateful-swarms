@@ -26,6 +26,9 @@ RECENT ENTRIES:
 DISPUTED:
 {disputed}
 
+ENTITY OVERVIEW INVENTORY:
+{entity_overviews}
+
 Create 1-5 workers. For each:
 {{"description": "specific task — be precise about what to extract or analyze", "reads_from_blackboard": ["e1"],
   "reads_from_documents": [{{"document": "name", "sections": ["Sec 4"]}}],
@@ -53,6 +56,8 @@ GUIDELINES:
   (e) For comparison tasks: systematically compare each item across sources
 - CONVERGE when analysis entries exist AND new iterations yield diminishing returns (few new findings). Do not converge if only observations exist with no analysis/calculation entries.
 - EXTRACTION GAPS: If a document has many more items than we've extracted, dispatch targeted re-extraction
+- For a substantive entity-focused task, use an available overview ID in reads_from_blackboard.
+- Consult prior entity findings before assigning a repeat investigation. State whether the repeat checks another source, narrows extraction, resolves a contradiction, or independently verifies a claim. Repeats remain allowed when they can add evidence.
 """
 
 
@@ -129,7 +134,7 @@ def _build_orchestrator_doc_list(blackboard: Blackboard, summary: dict) -> str:
 
 
 def run_orchestrator(blackboard: Blackboard, caller: ModelCaller,
-                     override: str = "") -> tuple[dict, int]:
+                     override: str = "", entity_overviews: list[dict] | None = None) -> tuple[dict, int]:
     summary = blackboard.get_summary()
     docs = _build_orchestrator_doc_list(blackboard, summary)
 
@@ -147,13 +152,18 @@ def run_orchestrator(blackboard: Blackboard, caller: ModelCaller,
         f"- [{e.type}] (conf={e.confidence:.1f}) {e.content[:200]}"
         for e in summary["disputed_entries"][:10]
     ) or "None"
+    overview_text = "\n".join(
+        f"- {item['entity_id']}: overview={item['overview_id'] or 'missing'}, "
+        f"matched={len(item['matched_card_ids'])}"
+        for item in (entity_overviews or [])
+    ) or "None"
 
     prompt = ORCHESTRATOR_PROMPT.format(
         task_instruction=blackboard.task_instruction, documents=docs,
         iteration=summary["iteration"],
         entry_counts=json.dumps(summary["entry_counts"]),
         budget_pct=summary["budget_used_pct"], signals=sigs,
-        recent=recent, disputed=disputed,
+        recent=recent, disputed=disputed, entity_overviews=overview_text,
     )
 
     from .web_search import web_search_enabled
