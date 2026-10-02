@@ -20,10 +20,15 @@ dependencies = [
     "trafilatura>=2.0.0",
     # Utilities
     "pandas>=2.0.0",
-    # Testing
-    "pytest>=8.0.0",
     # MCP server
     "mcp>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov",
+    "pytest-asyncio",
 ]
 
 [project.scripts]
