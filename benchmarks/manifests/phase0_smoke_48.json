@@ -1,4 +1,4 @@
-﻿{
+{
     "bench_root":  "$HARVEY_BENCH_ROOT",
     "tasks":  [
                   {
@@ -145,6 +145,5 @@
                   {
                       "task_id":  "white-collar-defense-investigations/identify-suspicious-patterns-in-financial-transaction-records"
                   }
-              ],
-    "bench_root":  "C:/Users/devan/OneDrive/Desktop/Projects/harvey-labs"
+              ]
 }
